@@ -68,9 +68,35 @@ export default function BoothManagement() {
 
   const copySubmissionLink = (token, boothId) => {
     const link = `${window.location.origin}/submit/${token}`
-    navigator.clipboard.writeText(link)
-    setCopiedId(boothId)
-    setTimeout(() => setCopiedId(null), 2000)
+    const doCopy = () => {
+      // Try the modern clipboard API first
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(link).then(() => {
+          setCopiedId(boothId)
+          setTimeout(() => setCopiedId(null), 2000)
+        }).catch(() => {
+          // Fallback silently
+        })
+      } else {
+        // Fallback for older browsers / non-HTTPS
+        const textarea = document.createElement('textarea')
+        textarea.value = link
+        textarea.style.position = 'fixed'
+        textarea.style.left = '-9999px'
+        document.body.appendChild(textarea)
+        textarea.focus()
+        textarea.select()
+        try {
+          document.execCommand('copy')
+          setCopiedId(boothId)
+          setTimeout(() => setCopiedId(null), 2000)
+        } catch (err) {
+          // Copy failed
+        }
+        document.body.removeChild(textarea)
+      }
+    }
+    doCopy()
   }
 
   const getStatusColor = (status) => {
