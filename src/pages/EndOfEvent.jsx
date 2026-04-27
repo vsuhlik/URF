@@ -1,26 +1,34 @@
-// src/pages/EndOfEvent.jsx
 import { useState, useEffect, useMemo } from 'react'
 import { supabase } from '../lib/supabase'
-import { useEvent } from '../hooks/useEvent'
 
 export default function EndOfEvent() {
-  const { event } = useEvent()
-  const eventId = event.id
-
+  const [eventId, setEventId] = useState(null)
   const [orders, setOrders] = useState([])
   const [searchQuery, setSearchQuery] = useState('')
-  const [activeTab, setActiveTab] = useState('pickup') // pickup|delivery|search
+  const [activeTab, setActiveTab] = useState('pickup')
   const [loading, setLoading] = useState(true)
 
-  // Fetch all sold orders that are not yet picked up or delivered
   useEffect(() => {
+    const getEvent = async () => {
+      const { data } = await supabase
+        .from('events')
+        .select('id')
+        .eq('status', 'active')
+        .single()
+      if (data) setEventId(data.id)
+    }
+    getEvent()
+  }, [])
+
+  useEffect(() => {
+    if (!eventId) return
     const fetchOrders = async () => {
       setLoading(true)
       const { data } = await supabase
         .from('orders')
         .select('*, customer:customers( id, name, phone, email, delivery_fee_paid, address )')
         .eq('event_id', eventId)
-        .in('status', ['sold', 'partially_picked_up'])  // adjust if you have custom statuses
+        .in('status', ['sold', 'partially_picked_up'])
         .order('created_at', { ascending: false })
 
       setOrders(data || [])
@@ -29,7 +37,6 @@ export default function EndOfEvent() {
     fetchOrders()
   }, [eventId])
 
-  // Group orders by customer (using customer_id if available, else name+phone)
   const customerGroups = useMemo(() => {
     const map = new Map()
     orders.forEach(order => {
@@ -51,15 +58,17 @@ export default function EndOfEvent() {
     return Array.from(map.values())
   }, [orders])
 
-  // Compute pending pickup/delivery groups for tabs
   const pickupGroups = customerGroups.filter(group =>
-    group.orders.some(order => order.items.some(item => item.fulfillmentType === 'pickup' && order.status !== 'pickedup'))
+    group.orders.some(order =>
+      order.items.some(item => item.fulfillmentType === 'pickup' && item.status !== 'pickedup')
+    )
   )
   const deliveryGroups = customerGroups.filter(group =>
-    group.orders.some(order => order.items.some(item => item.fulfillmentType === 'delivery' && order.status !== 'delivered'))
+    group.orders.some(order =>
+      order.items.some(item => item.fulfillmentType === 'delivery' && item.status !== 'delivered')
+    )
   )
 
-  // Search results (by name, confirmation, or phone)
   const searchResults = useMemo(() => {
     if (!searchQuery.trim()) return []
     const q = searchQuery.toLowerCase()
@@ -70,20 +79,15 @@ export default function EndOfEvent() {
     )
   }, [customerGroups, searchQuery])
 
-  // Mark item as picked up / delivered
   const markItemStatus = async (orderId, itemCode, newFulfillmentStatus, isDelivery) => {
-    // newFulfillmentStatus: 'pickedup' or 'delivered'
     const order = orders.find(o => o.id === orderId)
     if (!order) return
-
     const updatedItems = order.items.map(item => {
       if (item.itemCode === itemCode && item.fulfillmentType === (isDelivery ? 'delivery' : 'pickup')) {
         return { ...item, status: newFulfillmentStatus }
       }
       return item
     })
-
-    // Check if all items of that fulfillment type are now handled, and maybe update order status
     const allPickupDone = updatedItems.every(item => item.fulfillmentType !== 'pickup' || item.status === 'pickedup')
     const allDeliveryDone = updatedItems.every(item => item.fulfillmentType !== 'delivery' || item.status === 'delivered')
     let newOrderStatus = order.status
@@ -97,18 +101,16 @@ export default function EndOfEvent() {
       .eq('id', orderId)
 
     if (!error) {
-      // Refresh orders
       setOrders(prev => prev.map(o => o.id === orderId ? { ...o, items: updatedItems, status: newOrderStatus } : o))
     }
   }
 
-  // Move a single item from pickup to delivery (when customer already paid fee)
   const moveItemToDelivery = async (orderId, itemCode) => {
     const order = orders.find(o => o.id === orderId)
     if (!order) return
-    const customer = customerGroups.find(g => g.orders.some(o => o.id === orderId))
-    if (!customer.deliveryFeePaid) {
-      alert('Customer has not paid the delivery fee. Cannot add to delivery.')
+    const group = customerGroups.find(g => g.orders.some(o => o.id === orderId))
+    if (!group?.deliveryFeePaid) {
+      alert('Customer has not paid the delivery fee.')
       return
     }
 
@@ -118,10 +120,9 @@ export default function EndOfEvent() {
         : item
     )
 
-    // Ensure order has delivery address
     let orderUpdate = { items: updatedItems }
-    if (!order.deliveryAddress && customer.address) {
-      orderUpdate.deliveryAddress = customer.address
+    if (!order.deliveryAddress && group.address) {
+      orderUpdate.deliveryAddress = group.address
     }
 
     const { error } = await supabase
@@ -134,7 +135,6 @@ export default function EndOfEvent() {
     }
   }
 
-  // Render a group (customer card)
   const CustomerCard = ({ group }) => {
     const pickupItems = group.orders.flatMap(o =>
       o.items
@@ -163,7 +163,6 @@ export default function EndOfEvent() {
           )}
         </div>
 
-        {/* Pickup section */}
         {pickupItems.length > 0 && (
           <div className="mt-4">
             <h4 className="font-semibold text-sm text-gray-700 mb-2">📍 Pickup Items</h4>
@@ -175,7 +174,6 @@ export default function EndOfEvent() {
                     <button
                       onClick={() => moveItemToDelivery(item.orderId, item.itemCode)}
                       className="text-xs text-purple-600 underline"
-                      title="Move to delivery"
                     >
                       Add to Delivery
                     </button>
@@ -192,7 +190,6 @@ export default function EndOfEvent() {
           </div>
         )}
 
-        {/* Delivery section */}
         {deliveryItems.length > 0 && (
           <div className="mt-4">
             <h4 className="font-semibold text-sm text-purple-700 mb-2">🚚 Delivery Items</h4>
@@ -218,13 +215,20 @@ export default function EndOfEvent() {
     )
   }
 
+  if (!eventId) {
+    return (
+      <div className="min-h-screen bg-[#1a1a2e] flex items-center justify-center text-white">
+        <p>No active event found.</p>
+      </div>
+    )
+  }
+
   if (loading) return <div className="p-4">Loading orders...</div>
 
   return (
     <div className="max-w-5xl mx-auto p-4">
       <h2 className="text-2xl font-bold mb-4">End of Event – Pickup & Delivery</h2>
 
-      {/* Tabs */}
       <div className="flex gap-2 mb-4">
         <button
           onClick={() => setActiveTab('pickup')}
@@ -246,7 +250,6 @@ export default function EndOfEvent() {
         </button>
       </div>
 
-      {/* Search bar (visible only in search tab, but we can keep it there) */}
       {activeTab === 'search' && (
         <div className="mb-4">
           <input
@@ -260,7 +263,6 @@ export default function EndOfEvent() {
         </div>
       )}
 
-      {/* Lists */}
       <div>
         {activeTab === 'pickup' && pickupGroups.map(group => <CustomerCard key={group.customerId || group.customerPhone} group={group} />)}
         {activeTab === 'delivery' && deliveryGroups.map(group => <CustomerCard key={group.customerId || group.customerPhone} group={group} />)}

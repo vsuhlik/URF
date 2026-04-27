@@ -1,38 +1,39 @@
-// src/pages/Checkout.jsx   (adjust path if needed)
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
-import { useEvent } from '../hooks/useEvent'
 import CustomerLookup from '../components/CustomerLookup'
-import { sendReceiptEmail } from '../lib/email'   // your existing email function
 
 export default function Checkout() {
-  const { event } = useEvent()
-  const eventId = event.id
+  const [eventId, setEventId] = useState(null)
 
-  // Screen state: 'lookup' | 'cart' | 'address' | 'confirmation'
+  useEffect(() => {
+    const getEvent = async () => {
+      const { data } = await supabase
+        .from('events')
+        .select('id')
+        .eq('status', 'active')
+        .single()
+      if (data) setEventId(data.id)
+    }
+    getEvent()
+  }, [])
+
   const [screen, setScreen] = useState('lookup')
   const [customer, setCustomer] = useState(null)
-
-  // Cart items: array of { itemCode, description, price, ...itemData, fulfillmentType: 'pickup'|'delivery' }
   const [cart, setCart] = useState([])
   const [scanInput, setScanInput] = useState('')
   const [scanError, setScanError] = useState('')
 
-  // Address form
   const [address, setAddress] = useState({ street: '', city: '', zip: '' })
   const [addressError, setAddressError] = useState('')
 
-  // Confirmation state
   const [confirmation, setConfirmation] = useState(null)
 
-  // Delivery fee paid banner
   const deliveryPaid = customer?.delivery_fee_paid === true
   const hasDeliveryItems = cart.some(item => item.fulfillmentType === 'delivery')
   const needsDeliveryFee = hasDeliveryItems && !deliveryPaid
   const subtotal = cart.reduce((sum, item) => sum + Number(item.price), 0)
   const total = needsDeliveryFee ? subtotal + 25 : subtotal
 
-  // Reset everything when starting new customer
   const startNewCustomer = () => {
     setScreen('lookup')
     setCustomer(null)
@@ -42,24 +43,25 @@ export default function Checkout() {
     setConfirmation(null)
   }
 
-  // Handle customer identification from lookup component
   const handleCustomerIdentified = (customerData) => {
     setCustomer(customerData)
     setScreen('cart')
     setCart([])
   }
 
-  // Add item to cart by scanning or typing item code
   const addItemToCart = async (code) => {
-    if (!code) return
+    if (!code || !eventId) return
     setScanError('')
-    // Fetch item from database
+    console.log('🔍 Looking up item:', code.toUpperCase(), 'Event ID:', eventId)
+
     const { data: item, error } = await supabase
       .from('items')
-      .select('id, item_code, booth_number, description, price, status')
+      .select('id, item_code, description, price, status')
       .eq('event_id', eventId)
       .eq('item_code', code.toUpperCase())
       .maybeSingle()
+
+    console.log('📦 Supabase response:', { item, error })
 
     if (error || !item) {
       setScanError('Item not found: ' + code)
@@ -69,7 +71,6 @@ export default function Checkout() {
       setScanError('Item already sold')
       return
     }
-    // Check if already in cart
     if (cart.find(i => i.itemCode === item.item_code)) {
       setScanError('Already in cart')
       return
@@ -78,9 +79,8 @@ export default function Checkout() {
       itemCode: item.item_code,
       description: item.description,
       price: item.price,
-      boothNumber: item.booth_number,
       itemId: item.id,
-      fulfillmentType: 'pickup'   // default
+      fulfillmentType: 'pickup'
     }])
   }
 
@@ -91,7 +91,6 @@ export default function Checkout() {
     setScanInput('')
   }
 
-  // Toggle fulfillment type for a cart item
   const toggleFulfillment = (itemCode) => {
     setCart(prev => prev.map(item =>
       item.itemCode === itemCode
@@ -100,37 +99,32 @@ export default function Checkout() {
     ))
   }
 
-  // Proceed from cart to address collection (if needed) or directly to sale
   const handleProceedToCheckout = () => {
     if (hasDeliveryItems && !deliveryPaid) {
-      // Need address
       setScreen('address')
-      // Pre-fill if customer previously had address
       if (customer.address) {
         setAddress(customer.address)
       }
     } else {
-      // No address needed or delivery fee already paid
-      confirmSale(null)  // no new address needed
+      confirmSale(null)
     }
   }
 
-  // Final sale confirmation
   const confirmSale = async (newAddress) => {
+    if (!eventId) return
+
     const deliveryItems = cart.filter(i => i.fulfillmentType === 'delivery')
-    const pickupItems = cart.filter(i => i.fulfillmentType === 'pickup')
     const allItemsArray = cart.map(i => ({
       itemCode: i.itemCode,
       description: i.description,
       price: i.price,
-      boothNumber: i.boothNumber,
       fulfillmentType: i.fulfillmentType
     }))
 
     let finalAddress = null
     if (deliveryItems.length > 0) {
       if (deliveryPaid) {
-        finalAddress = customer.address   // reuse stored address
+        finalAddress = customer.address
       } else {
         if (!newAddress || !newAddress.street || !newAddress.city || !newAddress.zip) {
           setAddressError('Full address is required for delivery.')
@@ -140,25 +134,22 @@ export default function Checkout() {
       }
     }
 
-    // Hard gate: double-check delivery fee not already paid (race condition safety)
+    // Race condition guard
     if (deliveryItems.length > 0 && !deliveryPaid) {
       const { data: freshCust } = await supabase
         .from('customers')
-        .select('delivery_fee_paid')
+        .select('delivery_fee_paid, address')
         .eq('id', customer.id)
         .single()
       if (freshCust?.delivery_fee_paid) {
-        // Race condition – fee was paid between screens
         alert('Delivery fee was just paid by another cashier. Fee waived.')
-        // proceed without fee but with address already stored
         finalAddress = freshCust.address || finalAddress
-        // update local state
         setCustomer({ ...customer, delivery_fee_paid: true, address: finalAddress })
-        // continue as if fee already paid
       }
     }
 
-    // Insert order
+    const confirmationNumber = Math.random().toString(36).substring(2, 6).toUpperCase()
+
     const orderData = {
       event_id: eventId,
       customer_id: customer.id,
@@ -169,7 +160,7 @@ export default function Checkout() {
       totalAmount: total,
       deliveryAddress: finalAddress,
       status: 'sold',
-      confirmationNumber: generateConfirmation(), // you have a function for this
+      confirmationNumber
     }
 
     const { data: order, error } = await supabase
@@ -183,34 +174,25 @@ export default function Checkout() {
       return
     }
 
-    // Mark all items as sold
+    // Mark items sold
     const itemIds = cart.map(i => i.itemId)
     await supabase
       .from('items')
       .update({ status: 'sold', order_id: order.id })
       .in('id', itemIds)
 
-    // If delivery and fee not yet paid, update customer
+    // Update customer if first delivery
     if (deliveryItems.length > 0 && !deliveryPaid) {
       await supabase
         .from('customers')
-        .update({
-          delivery_fee_paid: true,
-          address: finalAddress
-        })
+        .update({ delivery_fee_paid: true, address: finalAddress })
         .eq('id', customer.id)
-    }
-
-    // Send email receipt if customer has email
-    if (customer.email) {
-      sendReceiptEmail(order, customer.email)
     }
 
     setConfirmation(order)
     setScreen('confirmation')
   }
 
-  // Address form submission
   const handleAddressSubmit = (e) => {
     e.preventDefault()
     if (!address.street || !address.city || !address.zip) {
@@ -221,12 +203,6 @@ export default function Checkout() {
     confirmSale(address)
   }
 
-  // Helper: generate a short confirmation number (you may already have one)
-  const generateConfirmation = () => {
-    return Math.random().toString(36).substring(2, 6).toUpperCase()
-  }
-
-  // Edit customer info (name, phone, email) – inline modal or simple form
   const [showEditCustomer, setShowEditCustomer] = useState(false)
   const [editName, setEditName] = useState('')
   const [editPhone, setEditPhone] = useState('')
@@ -259,231 +235,261 @@ export default function Checkout() {
     }
   }
 
-  // ---------------- RENDER -----------------
+  if (!eventId) {
+    return (
+      <div className="min-h-screen bg-[#1a1a2e] flex items-center justify-center text-white">
+        <p>No active event found. Please create one first.</p>
+      </div>
+    )
+  }
+
   if (screen === 'lookup') {
     return <CustomerLookup onCustomerIdentified={handleCustomerIdentified} />
   }
 
   if (screen === 'confirmation') {
     return (
-      <div className="max-w-md mx-auto p-4 text-center">
-        <h2 className="text-2xl font-bold mb-2">Order Confirmed!</h2>
-        <p className="text-lg">Confirmation #: <strong>{confirmation.confirmationNumber}</strong></p>
-        <p className="text-sm text-gray-500 mt-4">You can now help the next customer.</p>
-        <button
-          onClick={startNewCustomer}
-          className="mt-6 w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700"
-        >
-          Start New Customer
-        </button>
+      <div className="min-h-screen bg-[#1a1a2e] text-white">
+        <header className="bg-[#16213e] px-6 py-4 flex items-center gap-4 shadow-md">
+          <h1 className="text-xl font-bold">Order Confirmed</h1>
+        </header>
+        <main className="p-6 max-w-md mx-auto text-center">
+          <div className="bg-[#16213e] rounded-2xl p-8">
+            <p className="text-4xl mb-4">🎉</p>
+            <p className="text-2xl font-bold mb-2">Confirmation #</p>
+            <p className="text-3xl font-mono text-purple-400 mb-6">{confirmation.confirmationNumber}</p>
+            <p className="text-gray-400 text-sm mb-8">You can now help the next customer.</p>
+            <button
+              onClick={startNewCustomer}
+              className="w-full bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 rounded-lg transition-colors"
+            >
+              Start New Customer
+            </button>
+          </div>
+        </main>
       </div>
     )
   }
 
-  // Cart Screen
   return (
-    <div className="max-w-4xl mx-auto p-4">
-      {/* Customer info header */}
-      <div className="flex justify-between items-center mb-4">
-        <div>
-          <h2 className="text-xl font-bold">{customer.name}</h2>
-          <p className="text-gray-600">{customer.phone}</p>
-        </div>
-        <button onClick={openEditCustomer} className="text-blue-600 underline text-sm">
-          Edit Info
-        </button>
-      </div>
-
-      {deliveryPaid && (
-        <div className="bg-yellow-100 border-l-4 border-yellow-500 p-4 mb-4">
-          <p className="font-bold">✅ DELIVERY FEE ALREADY PAID</p>
-          {customer.address && (
-            <p className="text-sm mt-1">
-              📍 {customer.address.street}, {customer.address.city}, {customer.address.zip}
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Scan / add item */}
-      <form onSubmit={handleScanSubmit} className="flex gap-2 mb-4">
-        <input
-          type="text"
-          value={scanInput}
-          onChange={(e) => setScanInput(e.target.value.toUpperCase())}
-          placeholder="Scan QR or type item code"
-          className="flex-1 border rounded px-3 py-2"
-          autoFocus
-        />
+    <div className="min-h-screen bg-[#1a1a2e] text-white">
+      <header className="bg-[#16213e] px-6 py-4 flex items-center justify-between shadow-md">
+        <h1 className="text-xl font-bold">Checkout</h1>
         <button
-          type="submit"
-          className="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700"
+          onClick={startNewCustomer}
+          className="text-gray-400 hover:text-white text-sm transition-colors"
         >
-          Add
+          Change Customer
         </button>
-      </form>
-      {scanError && <p className="text-red-600 text-sm mb-2">{scanError}</p>}
+      </header>
 
-      {/* Cart items */}
-      {cart.length === 0 ? (
-        <p className="text-gray-500 italic text-center py-8">Cart is empty. Scan an item to begin.</p>
-      ) : (
-        <div className="space-y-2">
-          {cart.map(item => (
-            <div key={item.itemCode} className="flex items-center justify-between border p-2 rounded">
-              <div className="flex-1">
-                <p className="font-medium">{item.itemCode} – {item.description}</p>
-                <p className="text-sm text-gray-500">${Number(item.price).toFixed(2)}</p>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => toggleFulfillment(item.itemCode)}
-                  className={`flex items-center px-3 py-1 rounded-full text-xs font-medium ${
-                    item.fulfillmentType === 'delivery'
-                      ? 'bg-purple-100 text-purple-800'
-                      : 'bg-gray-100 text-gray-800'
-                  }`}
-                  title="Toggle pickup/delivery"
-                >
-                  {item.fulfillmentType === 'delivery' ? '🚚 Delivery' : '📍 Pickup'}
-                </button>
-                <button
-                  onClick={() => setCart(prev => prev.filter(i => i.itemCode !== item.itemCode))}
-                  className="text-red-500 hover:text-red-700 ml-2"
-                >
-                  ✕
-                </button>
-              </div>
+      <main className="p-6 max-w-2xl mx-auto">
+        <div className="bg-[#16213e] rounded-2xl p-4 mb-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-white font-bold">{customer.name}</p>
+              <p className="text-gray-400 text-sm">{customer.phone}</p>
             </div>
-          ))}
+            <button onClick={openEditCustomer} className="text-purple-400 text-sm underline hover:text-purple-300">
+              Edit Info
+            </button>
+          </div>
+        </div>
 
-          <div className="border-t pt-3 mt-4 text-right">
-            <p className="text-lg">
-              Subtotal: <strong>${subtotal.toFixed(2)}</strong>
-            </p>
-            {needsDeliveryFee && (
-              <p className="text-sm text-purple-700">+ $25.00 delivery fee</p>
+        {deliveryPaid && (
+          <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4 mb-4">
+            <p className="text-yellow-400 font-semibold">✅ DELIVERY FEE ALREADY PAID</p>
+            {customer.address && (
+              <p className="text-gray-400 text-sm mt-1">
+                📍 {customer.address.street}, {customer.address.city}, {customer.address.zip}
+              </p>
             )}
-            <p className="text-2xl font-bold mt-1">Total: ${total.toFixed(2)}</p>
           </div>
+        )}
 
+        <form onSubmit={handleScanSubmit} className="flex gap-2 mb-4">
+          <input
+            type="text"
+            value={scanInput}
+            onChange={(e) => setScanInput(e.target.value.toUpperCase())}
+            placeholder="Scan QR or type item code (e.g. 6-2)"
+            className="flex-1 bg-[#0f3460] text-white rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-purple-500"
+            autoFocus
+          />
           <button
-            onClick={handleProceedToCheckout}
-            className="w-full bg-blue-600 text-white py-3 rounded text-lg mt-4 hover:bg-blue-700"
+            type="submit"
+            className="bg-purple-600 hover:bg-purple-700 text-white font-semibold px-6 py-3 rounded-lg transition-colors"
           >
-            Checkout
+            Add
           </button>
-        </div>
-      )}
+        </form>
+        {scanError && <p className="text-red-400 text-sm mb-2">{scanError}</p>}
 
-      {/* Address modal (shown when screen === 'address') */}
-      {screen === 'address' && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg p-6 w-full max-w-md">
-            <h3 className="text-xl font-bold mb-4">Delivery Address</h3>
-            <form onSubmit={handleAddressSubmit} className="space-y-3">
-              <div>
-                <label className="block text-sm font-medium mb-1">Street *</label>
-                <input
-                  type="text"
-                  value={address.street}
-                  onChange={(e) => setAddress(prev => ({ ...prev, street: e.target.value }))}
-                  className="w-full border rounded px-3 py-2"
-                  required
-                />
+        {cart.length === 0 ? (
+          <p className="text-gray-500 italic text-center py-8">Cart is empty. Scan an item to begin.</p>
+        ) : (
+          <div className="space-y-3">
+            {cart.map(item => (
+              <div key={item.itemCode} className="bg-[#16213e] rounded-xl p-4 flex items-center justify-between">
+                <div>
+                  <p className="text-purple-400 text-xs font-mono">{item.itemCode}</p>
+                  <p className="text-white text-sm font-medium">{item.description}</p>
+                  <p className="text-green-400 text-sm font-bold mt-1">${Number(item.price).toFixed(2)}</p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => toggleFulfillment(item.itemCode)}
+                    className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                      item.fulfillmentType === 'delivery'
+                        ? 'bg-purple-600/30 text-purple-300'
+                        : 'bg-gray-600/30 text-gray-300'
+                    }`}
+                  >
+                    {item.fulfillmentType === 'delivery' ? '🚚 Delivery' : '📍 Pickup'}
+                  </button>
+                  <button
+                    onClick={() => setCart(prev => prev.filter(i => i.itemCode !== item.itemCode))}
+                    className="text-red-400 hover:text-red-300 text-lg"
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">City *</label>
-                <input
-                  type="text"
-                  value={address.city}
-                  onChange={(e) => setAddress(prev => ({ ...prev, city: e.target.value }))}
-                  className="w-full border rounded px-3 py-2"
-                  required
-                />
+            ))}
+
+            <div className="bg-[#16213e] rounded-xl p-4 mt-4">
+              <div className="flex justify-between text-gray-300 text-sm">
+                <span>Subtotal</span>
+                <span>${subtotal.toFixed(2)}</span>
               </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Zip *</label>
-                <input
-                  type="text"
-                  value={address.zip}
-                  onChange={(e) => setAddress(prev => ({ ...prev, zip: e.target.value }))}
-                  className="w-full border rounded px-3 py-2"
-                  required
-                />
+              {needsDeliveryFee && (
+                <div className="flex justify-between text-purple-400 text-sm mt-1">
+                  <span>Delivery Fee</span>
+                  <span>+ $25.00</span>
+                </div>
+              )}
+              <div className="flex justify-between text-white font-bold text-xl mt-2 pt-2 border-t border-gray-700">
+                <span>Total</span>
+                <span>${total.toFixed(2)}</span>
               </div>
-              {addressError && <p className="text-red-600 text-sm">{addressError}</p>}
-              <div className="flex gap-2">
-                <button
-                  type="submit"
-                  className="flex-1 bg-green-600 text-white py-2 rounded hover:bg-green-700"
-                >
-                  Confirm & Pay ${total.toFixed(2)}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setScreen('cart')}
-                  className="flex-1 bg-gray-300 py-2 rounded hover:bg-gray-400"
-                >
-                  Cancel
-                </button>
-              </div>
-            </form>
+            </div>
+
+            <button
+              onClick={handleProceedToCheckout}
+              className="w-full bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 rounded-lg transition-colors mt-4"
+            >
+              Checkout
+            </button>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Edit Customer modal */}
-      {showEditCustomer && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg p-6 w-full max-w-md">
-            <h3 className="text-xl font-bold mb-4">Edit Customer</h3>
-            <div className="space-y-3">
-              <div>
-                <label className="block text-sm font-medium mb-1">Name</label>
-                <input
-                  type="text"
-                  value={editName}
-                  onChange={(e) => setEditName(e.target.value)}
-                  className="w-full border rounded px-3 py-2"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Phone</label>
-                <input
-                  type="tel"
-                  value={editPhone}
-                  onChange={(e) => setEditPhone(e.target.value)}
-                  className="w-full border rounded px-3 py-2"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Email (optional)</label>
-                <input
-                  type="email"
-                  value={editEmail}
-                  onChange={(e) => setEditEmail(e.target.value)}
-                  className="w-full border rounded px-3 py-2"
-                />
-              </div>
-              <div className="flex gap-2 mt-4">
-                <button
-                  onClick={saveEditCustomer}
-                  className="flex-1 bg-blue-600 text-white py-2 rounded hover:bg-blue-700"
-                >
-                  Save
-                </button>
-                <button
-                  onClick={() => setShowEditCustomer(false)}
-                  className="flex-1 bg-gray-300 py-2 rounded hover:bg-gray-400"
-                >
-                  Cancel
-                </button>
+        {screen === 'address' && (
+          <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+            <div className="bg-[#16213e] rounded-2xl p-6 w-full max-w-md text-white">
+              <h3 className="text-xl font-bold mb-4">Delivery Address</h3>
+              <form onSubmit={handleAddressSubmit} className="space-y-4">
+                <div>
+                  <label className="text-gray-400 text-sm mb-1 block">Street *</label>
+                  <input
+                    type="text"
+                    value={address.street}
+                    onChange={(e) => setAddress(prev => ({ ...prev, street: e.target.value }))}
+                    className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="text-gray-400 text-sm mb-1 block">City *</label>
+                  <input
+                    type="text"
+                    value={address.city}
+                    onChange={(e) => setAddress(prev => ({ ...prev, city: e.target.value }))}
+                    className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="text-gray-400 text-sm mb-1 block">Zip *</label>
+                  <input
+                    type="text"
+                    value={address.zip}
+                    onChange={(e) => setAddress(prev => ({ ...prev, zip: e.target.value }))}
+                    className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                    required
+                  />
+                </div>
+                {addressError && <p className="text-red-400 text-sm">{addressError}</p>}
+                <div className="flex gap-3">
+                  <button
+                    type="submit"
+                    className="flex-1 bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 rounded-lg transition-colors"
+                  >
+                    Confirm & Pay ${total.toFixed(2)}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setScreen('cart')}
+                    className="flex-1 bg-gray-600 hover:bg-gray-700 text-white font-semibold py-3 rounded-lg transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {showEditCustomer && (
+          <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+            <div className="bg-[#16213e] rounded-2xl p-6 w-full max-w-md text-white">
+              <h3 className="text-xl font-bold mb-4">Edit Customer</h3>
+              <div className="space-y-4">
+                <div>
+                  <label className="text-gray-400 text-sm mb-1 block">Name</label>
+                  <input
+                    type="text"
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-gray-400 text-sm mb-1 block">Phone</label>
+                  <input
+                    type="tel"
+                    value={editPhone}
+                    onChange={(e) => setEditPhone(e.target.value)}
+                    className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-gray-400 text-sm mb-1 block">Email (optional)</label>
+                  <input
+                    type="email"
+                    value={editEmail}
+                    onChange={(e) => setEditEmail(e.target.value)}
+                    className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+                <div className="flex gap-3 mt-4">
+                  <button
+                    onClick={saveEditCustomer}
+                    className="flex-1 bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 rounded-lg transition-colors"
+                  >
+                    Save
+                  </button>
+                  <button
+                    onClick={() => setShowEditCustomer(false)}
+                    className="flex-1 bg-gray-600 hover:bg-gray-700 text-white font-semibold py-3 rounded-lg transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </main>
     </div>
   )
 }

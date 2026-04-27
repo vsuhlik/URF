@@ -1,12 +1,8 @@
-// src/components/CustomerLookup.jsx
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
-import { useEvent } from '../hooks/useEvent'   // adjust path as needed
 
 export default function CustomerLookup({ onCustomerIdentified }) {
-  const { event } = useEvent()
-  const eventId = event.id
-
+  const [eventId, setEventId] = useState(null)
   const [phone, setPhone] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -16,16 +12,28 @@ export default function CustomerLookup({ onCustomerIdentified }) {
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
 
+  useEffect(() => {
+    const getEvent = async () => {
+      const { data } = await supabase
+        .from('events')
+        .select('id')
+        .eq('status', 'active')
+        .single()
+      if (data) setEventId(data.id)
+    }
+    getEvent()
+  }, [])
+
   const strip = (p) => p.replace(/\D/g, '')
 
   const handleLookup = async (e) => {
     e.preventDefault()
+    if (!eventId) return setError('No active event')
     setError('')
     const digits = strip(phone)
     if (!digits) return setError('Please enter a phone number')
 
     setLoading(true)
-    // Search for customer by exact phone
     const { data, error: dbErr } = await supabase
       .from('customers')
       .select('*')
@@ -40,11 +48,9 @@ export default function CustomerLookup({ onCustomerIdentified }) {
     }
 
     if (data) {
-      // Found existing customer – pass back full customer object
       setLoading(false)
-      onCustomerIdentified({ ...data, phone: data.phone }) // keep digits
+      onCustomerIdentified({ ...data, phone: data.phone })
     } else {
-      // No customer yet – show inline creation form
       setNewCustomer({ phone: digits })
       setLoading(false)
     }
@@ -54,7 +60,6 @@ export default function CustomerLookup({ onCustomerIdentified }) {
     e.preventDefault()
     if (!name.trim()) return setError('Name is required')
 
-    setLoading(true)
     const customerData = {
       event_id: eventId,
       phone: newCustomer.phone,
@@ -64,6 +69,7 @@ export default function CustomerLookup({ onCustomerIdentified }) {
       address: null,
     }
 
+    setLoading(true)
     const { data, error: insertErr } = await supabase
       .from('customers')
       .insert(customerData)
@@ -80,71 +86,93 @@ export default function CustomerLookup({ onCustomerIdentified }) {
     onCustomerIdentified(data)
   }
 
-  // If we need to create a new customer
-  if (newCustomer) {
+  if (!eventId) {
     return (
-      <div className="max-w-md mx-auto p-4">
-        <h2 className="text-xl font-bold mb-4">New Customer</h2>
-        <p className="mb-2 text-gray-600">Phone: {newCustomer.phone}</p>
-        <form onSubmit={handleCreate} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium mb-1">Name *</label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="w-full border rounded px-3 py-2"
-              required
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium mb-1">Email (optional)</label>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="w-full border rounded px-3 py-2"
-            />
-          </div>
-          {error && <p className="text-red-600 text-sm">{error}</p>}
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full bg-green-600 text-white py-2 rounded hover:bg-green-700"
-          >
-            {loading ? 'Saving...' : 'Save & Continue'}
-          </button>
-        </form>
+      <div className="min-h-screen bg-[#1a1a2e] flex items-center justify-center text-white">
+        <div className="text-center">
+          <p className="text-red-400">No active event found. Please create one first.</p>
+        </div>
       </div>
     )
   }
 
-  // Main lookup screen
+  // New customer form
+  if (newCustomer) {
+    return (
+      <div className="min-h-screen bg-[#1a1a2e] text-white">
+        <header className="bg-[#16213e] px-6 py-4 shadow-md">
+          <h1 className="text-xl font-bold">New Customer</h1>
+        </header>
+        <main className="p-6 max-w-md mx-auto">
+          <div className="bg-[#16213e] rounded-2xl p-6 mb-4">
+            <p className="text-purple-400 text-sm mb-4">Phone: {newCustomer.phone}</p>
+            <form onSubmit={handleCreate} className="space-y-4">
+              <div>
+                <label className="text-gray-400 text-sm mb-1 block">Name *</label>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-gray-400 text-sm mb-1 block">Email (optional)</label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+              {error && <p className="text-red-400 text-sm">{error}</p>}
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 rounded-lg transition-colors disabled:opacity-50"
+              >
+                {loading ? 'Saving...' : 'Save & Continue'}
+              </button>
+            </form>
+          </div>
+        </main>
+      </div>
+    )
+  }
+
+  // Lookup screen
   return (
-    <div className="max-w-md mx-auto p-4">
-      <h2 className="text-xl font-bold mb-4">Customer Lookup</h2>
-      <form onSubmit={handleLookup} className="space-y-4">
-        <div>
-          <label className="block text-sm font-medium mb-1">Phone Number</label>
-          <input
-            type="tel"
-            value={phone}
-            onChange={(e) => setPhone(e.target.value)}
-            onFocus={(e) => e.target.select()}
-            className="w-full border rounded px-3 py-2 text-lg"
-            placeholder="Last 7 digits or full number"
-            autoFocus
-          />
+    <div className="min-h-screen bg-[#1a1a2e] text-white">
+      <header className="bg-[#16213e] px-6 py-4 shadow-md">
+        <h1 className="text-xl font-bold">Customer Lookup</h1>
+      </header>
+      <main className="p-6 max-w-md mx-auto">
+        <div className="bg-[#16213e] rounded-2xl p-6">
+          <form onSubmit={handleLookup} className="space-y-4">
+            <div>
+              <label className="text-gray-400 text-sm mb-1 block">Phone Number</label>
+              <input
+                type="tel"
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                onFocus={(e) => e.target.select()}
+                className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-3 text-lg outline-none focus:ring-2 focus:ring-purple-500"
+                placeholder="Last 7 digits or full number"
+                autoFocus
+              />
+            </div>
+            {error && <p className="text-red-400 text-sm">{error}</p>}
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 rounded-lg transition-colors disabled:opacity-50"
+            >
+              {loading ? 'Looking up...' : 'Find Customer'}
+            </button>
+          </form>
         </div>
-        {error && <p className="text-red-600 text-sm">{error}</p>}
-        <button
-          type="submit"
-          disabled={loading}
-          className="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700"
-        >
-          {loading ? 'Looking up...' : 'Find Customer'}
-        </button>
-      </form>
+      </main>
     </div>
   )
 }
