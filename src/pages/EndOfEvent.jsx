@@ -1,7 +1,9 @@
 import { useState, useEffect, useMemo } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 
 export default function EndOfEvent() {
+  const navigate = useNavigate()
   const [eventId, setEventId] = useState(null)
   const [orders, setOrders] = useState([])
   const [searchQuery, setSearchQuery] = useState('')
@@ -255,9 +257,12 @@ export default function EndOfEvent() {
 
   return (
     <div className="min-h-screen bg-[#1a1a2e] text-white">
-      <header className="bg-[#16213e] px-6 py-4 flex items-center gap-4 shadow-md">
-        <h1 className="text-xl font-bold">End of Event</h1>
-      </header>
+        <header className="bg-[#16213e] px-6 py-4 flex items-center gap-4 shadow-md">
+          <button onClick={() => navigate('/dashboard')} className="text-gray-400 hover:text-white transition-colors">
+            ← Back
+          </button>
+          <h1 className="text-xl font-bold">End of Event</h1>
+        </header>
 
       <main className="p-6 max-w-5xl mx-auto">
         <h2 className="text-2xl font-bold mb-4">Pickup & Delivery</h2>

@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 
 export default function Checkout() {
+  const navigate = useNavigate()
   const [eventId, setEventId] = useState(null)
 
   useEffect(() => {
@@ -331,7 +333,10 @@ const orderData = {
 
     return (
       <div className="min-h-screen bg-[#1a1a2e] text-white">
-        <header className="bg-[#16213e] px-6 py-4 shadow-md">
+        <header className="bg-[#16213e] px-6 py-4 flex items-center gap-4 shadow-md">
+          <button onClick={() => navigate('/dashboard')} className="text-gray-400 hover:text-white transition-colors">
+            ← Back
+          </button>
           <h1 className="text-xl font-bold">Checkout</h1>
         </header>
         <main className="p-6 max-w-2xl mx-auto">
@@ -468,6 +473,9 @@ const orderData = {
     return (
       <div className="min-h-screen bg-[#1a1a2e] text-white">
         <header className="bg-[#16213e] px-6 py-4 flex items-center gap-4 shadow-md">
+          <button onClick={() => navigate('/dashboard')} className="text-gray-400 hover:text-white transition-colors">
+            ← Back
+          </button>
           <h1 className="text-xl font-bold">Order Confirmed</h1>
         </header>
         <main className="p-6 max-w-md mx-auto text-center">
@@ -491,7 +499,12 @@ const orderData = {
   return (
     <div className="min-h-screen bg-[#1a1a2e] text-white">
       <header className="bg-[#16213e] px-6 py-4 flex items-center justify-between shadow-md">
-        <h1 className="text-xl font-bold">Checkout</h1>
+        <div className="flex items-center gap-4">
+          <button onClick={() => navigate('/dashboard')} className="text-gray-400 hover:text-white transition-colors">
+            ← Back
+          </button>
+          <h1 className="text-xl font-bold">Checkout</h1>
+        </div>
         <button
           onClick={startNewCustomer}
           className="text-gray-400 hover:text-white text-sm transition-colors"

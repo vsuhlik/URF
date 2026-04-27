@@ -7,6 +7,14 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: 'autoUpdate',
+      // Force network-only for all fetches – no offline support
+      workbox: {
+        runtimeCaching: [],
+        // Don't precache anything
+        globPatterns: [],
+        // Ensure the service worker doesn't serve stale content
+        navigateFallback: null
+      },
       manifest: {
         name: 'UpScale Resale Flow',
         short_name: 'UpScale',
