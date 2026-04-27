@@ -1,333 +1,274 @@
-import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+// src/pages/EndOfEvent.jsx
+import { useState, useEffect, useMemo } from 'react'
 import { supabase } from '../lib/supabase'
+import { useEvent } from '../hooks/useEvent'
 
 export default function EndOfEvent() {
-  const [event, setEvent] = useState(null)
+  const { event } = useEvent()
+  const eventId = event.id
+
   const [orders, setOrders] = useState([])
-  const [items, setItems] = useState([])
+  const [searchQuery, setSearchQuery] = useState('')
+  const [activeTab, setActiveTab] = useState('pickup') // pickup|delivery|search
   const [loading, setLoading] = useState(true)
-  const [search, setSearch] = useState('')
-  const [markingId, setMarkingId] = useState(null)
-const [activeTab, setActiveTab] = useState('pickup')
-  const navigate = useNavigate()
 
+  // Fetch all sold orders that are not yet picked up or delivered
   useEffect(() => {
-    fetchData()
-  }, [])
-
-  const fetchData = async () => {
-    const { data: eventData } = await supabase
-      .from('events')
-      .select('*')
-      .eq('status', 'active')
-      .single()
-
-    if (eventData) {
-      setEvent(eventData)
-
-      const { data: orderData } = await supabase
+    const fetchOrders = async () => {
+      setLoading(true)
+      const { data } = await supabase
         .from('orders')
-        .select('*')
-        .eq('event_id', eventData.id)
+        .select('*, customer:customers( id, name, phone, email, delivery_fee_paid, address )')
+        .eq('event_id', eventId)
+        .in('status', ['sold', 'partially_picked_up'])  // adjust if you have custom statuses
         .order('created_at', { ascending: false })
 
-      const { data: itemData } = await supabase
-        .from('items')
-        .select('*')
-        .eq('event_id', eventData.id)
-        .in('status', ['sold', 'pickedup'])
-
-      setOrders(orderData || [])
-      setItems(itemData || [])
+      setOrders(data || [])
+      setLoading(false)
     }
-    setLoading(false)
-  }
+    fetchOrders()
+  }, [eventId])
 
-  const getOrderItems = (orderId) => items.filter(i => i.order_id === orderId)
-
-  // Group a list of orders by customer (name + phone as key)
-  const groupByCustomer = (orderList) => {
-    const groups = {}
-    orderList.forEach(order => {
-      const key = `${order.customer_name}__${order.customer_phone || ''}`
-      if (!groups[key]) {
-        groups[key] = { name: order.customer_name, phone: order.customer_phone, orders: [] }
+  // Group orders by customer (using customer_id if available, else name+phone)
+  const customerGroups = useMemo(() => {
+    const map = new Map()
+    orders.forEach(order => {
+      const custId = order.customer?.id || order.customer_id
+      const key = custId || `${order.customerName}__${order.customerPhone}`
+      if (!map.has(key)) {
+        map.set(key, {
+          customerId: custId,
+          customerName: order.customer?.name || order.customerName,
+          customerPhone: order.customer?.phone || order.customerPhone,
+          email: order.customer?.email || order.customerEmail,
+          deliveryFeePaid: order.customer?.delivery_fee_paid || false,
+          address: order.customer?.address || null,
+          orders: []
+        })
       }
-      groups[key].orders.push(order)
+      map.get(key).orders.push(order)
     })
-    return Object.values(groups)
-  }
+    return Array.from(map.values())
+  }, [orders])
 
-  const matchingOrders = (() => {
-    const s = search.toLowerCase().trim()
-    if (!s) return []
-    const sDigits = s.replace(/\D/g, '')
-    return orders.filter(o =>
-      o.customer_name.toLowerCase().includes(s) ||
-      o.confirmation_number.toLowerCase().includes(s) ||
-      (sDigits.length > 0 && o.customer_phone && o.customer_phone.replace(/\D/g, '').includes(sDigits))
+  // Compute pending pickup/delivery groups for tabs
+  const pickupGroups = customerGroups.filter(group =>
+    group.orders.some(order => order.items.some(item => item.fulfillmentType === 'pickup' && order.status !== 'pickedup'))
+  )
+  const deliveryGroups = customerGroups.filter(group =>
+    group.orders.some(order => order.items.some(item => item.fulfillmentType === 'delivery' && order.status !== 'delivered'))
+  )
+
+  // Search results (by name, confirmation, or phone)
+  const searchResults = useMemo(() => {
+    if (!searchQuery.trim()) return []
+    const q = searchQuery.toLowerCase()
+    return customerGroups.filter(group =>
+      group.customerName.toLowerCase().includes(q) ||
+      group.customerPhone.includes(searchQuery.replace(/\D/g, '')) ||
+      group.orders.some(o => o.confirmationNumber?.toLowerCase().includes(q))
     )
-  })()
+  }, [customerGroups, searchQuery])
 
-  const customerGroups = groupByCustomer(matchingOrders)
+  // Mark item as picked up / delivered
+  const markItemStatus = async (orderId, itemCode, newFulfillmentStatus, isDelivery) => {
+    // newFulfillmentStatus: 'pickedup' or 'delivered'
+    const order = orders.find(o => o.id === orderId)
+    if (!order) return
 
-  const handleMarkPickedUp = async (orderId) => {
-    setMarkingId(orderId)
-    await supabase.from('orders').update({ status: 'pickedup' }).eq('id', orderId)
-    await supabase.from('items').update({ status: 'pickedup' }).eq('order_id', orderId)
-    await fetchData()
-    setMarkingId(null)
-  }
+    const updatedItems = order.items.map(item => {
+      if (item.itemCode === itemCode && item.fulfillmentType === (isDelivery ? 'delivery' : 'pickup')) {
+        return { ...item, status: newFulfillmentStatus }
+      }
+      return item
+    })
 
-  const handleMarkDelivered = async (orderId) => {
-    setMarkingId(orderId)
-    await supabase.from('orders').update({ status: 'delivered' }).eq('id', orderId)
-    await supabase.from('items').update({ status: 'pickedup' }).eq('order_id', orderId)
-    await fetchData()
-    setMarkingId(null)
-  }
+    // Check if all items of that fulfillment type are now handled, and maybe update order status
+    const allPickupDone = updatedItems.every(item => item.fulfillmentType !== 'pickup' || item.status === 'pickedup')
+    const allDeliveryDone = updatedItems.every(item => item.fulfillmentType !== 'delivery' || item.status === 'delivered')
+    let newOrderStatus = order.status
+    if (allPickupDone && allDeliveryDone) newOrderStatus = 'completed'
+    else if (allPickupDone) newOrderStatus = 'pickedup'
+    else if (allDeliveryDone) newOrderStatus = 'delivered'
 
-  // Move a pickup order to delivery at no extra charge — uses existing delivery address
-  const handleMoveToDelivery = async (orderId, deliveryAddress) => {
-    if (!confirm('Move this order to delivery? No additional fee will be charged.')) return
-    setMarkingId(orderId)
-    await supabase
+    const { error } = await supabase
       .from('orders')
-      .update({ fulfillment_type: 'delivery', delivery_address: deliveryAddress })
+      .update({ items: updatedItems, status: newOrderStatus })
       .eq('id', orderId)
-    await fetchData()
-    setMarkingId(null)
+
+    if (!error) {
+      // Refresh orders
+      setOrders(prev => prev.map(o => o.id === orderId ? { ...o, items: updatedItems, status: newOrderStatus } : o))
+    }
   }
 
-const pendingPickupOrders = orders.filter(o => o.fulfillment_type === 'pickup' && o.status === 'sold')
-const pendingDeliveryOrders = orders.filter(o => o.fulfillment_type === 'delivery' && o.status === 'sold')
-const pendingPickup = pendingPickupOrders.length
-const pendingDelivery = pendingDeliveryOrders.length
-const pickupGroups = groupByCustomer(pendingPickupOrders)
-const deliveryGroups = groupByCustomer(pendingDeliveryOrders)
+  // Move a single item from pickup to delivery (when customer already paid fee)
+  const moveItemToDelivery = async (orderId, itemCode) => {
+    const order = orders.find(o => o.id === orderId)
+    if (!order) return
+    const customer = customerGroups.find(g => g.orders.some(o => o.id === orderId))
+    if (!customer.deliveryFeePaid) {
+      alert('Customer has not paid the delivery fee. Cannot add to delivery.')
+      return
+    }
 
-const activeGroups = activeTab === 'search' ? customerGroups : activeTab === 'pickup' ? pickupGroups : deliveryGroups
+    const updatedItems = order.items.map(item =>
+      item.itemCode === itemCode && item.fulfillmentType === 'pickup'
+        ? { ...item, fulfillmentType: 'delivery', status: 'sold' }
+        : item
+    )
+
+    // Ensure order has delivery address
+    let orderUpdate = { items: updatedItems }
+    if (!order.deliveryAddress && customer.address) {
+      orderUpdate.deliveryAddress = customer.address
+    }
+
+    const { error } = await supabase
+      .from('orders')
+      .update(orderUpdate)
+      .eq('id', orderId)
+
+    if (!error) {
+      setOrders(prev => prev.map(o => o.id === orderId ? { ...o, items: updatedItems, ...orderUpdate } : o))
+    }
+  }
+
+  // Render a group (customer card)
+  const CustomerCard = ({ group }) => {
+    const pickupItems = group.orders.flatMap(o =>
+      o.items
+        .filter(item => item.fulfillmentType === 'pickup' && item.status !== 'pickedup')
+        .map(item => ({ ...item, orderId: o.id, confirmationNumber: o.confirmationNumber }))
+    )
+    const deliveryItems = group.orders.flatMap(o =>
+      o.items
+        .filter(item => item.fulfillmentType === 'delivery' && item.status !== 'delivered')
+        .map(item => ({ ...item, orderId: o.id, confirmationNumber: o.confirmationNumber }))
+    )
+
+    if (pickupItems.length === 0 && deliveryItems.length === 0) return null
+
+    return (
+      <div className="border rounded-lg p-4 mb-4 bg-white shadow">
+        <div className="flex justify-between items-start">
+          <div>
+            <h3 className="font-bold text-lg">{group.customerName}</h3>
+            <p className="text-gray-600">{group.customerPhone}</p>
+          </div>
+          {group.deliveryFeePaid && (
+            <span className="bg-green-100 text-green-800 px-2 py-1 rounded-full text-xs font-bold">
+              ✓ Delivery Paid
+            </span>
+          )}
+        </div>
+
+        {/* Pickup section */}
+        {pickupItems.length > 0 && (
+          <div className="mt-4">
+            <h4 className="font-semibold text-sm text-gray-700 mb-2">📍 Pickup Items</h4>
+            {pickupItems.map(item => (
+              <div key={`${item.orderId}-${item.itemCode}`} className="flex items-center justify-between border-b py-1">
+                <span>{item.itemCode} – {item.description} <span className="text-sm text-gray-500">(Conf #{item.confirmationNumber})</span></span>
+                <div className="flex gap-2">
+                  {group.deliveryFeePaid && (
+                    <button
+                      onClick={() => moveItemToDelivery(item.orderId, item.itemCode)}
+                      className="text-xs text-purple-600 underline"
+                      title="Move to delivery"
+                    >
+                      Add to Delivery
+                    </button>
+                  )}
+                  <button
+                    onClick={() => markItemStatus(item.orderId, item.itemCode, 'pickedup', false)}
+                    className="bg-green-500 text-white px-2 py-1 rounded text-xs"
+                  >
+                    Picked Up
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Delivery section */}
+        {deliveryItems.length > 0 && (
+          <div className="mt-4">
+            <h4 className="font-semibold text-sm text-purple-700 mb-2">🚚 Delivery Items</h4>
+            {group.address && (
+              <p className="text-xs text-gray-500 mb-1">
+                Address: {group.address.street}, {group.address.city} {group.address.zip}
+              </p>
+            )}
+            {deliveryItems.map(item => (
+              <div key={`${item.orderId}-${item.itemCode}`} className="flex items-center justify-between border-b py-1">
+                <span>{item.itemCode} – {item.description} <span className="text-sm text-gray-500">(Conf #{item.confirmationNumber})</span></span>
+                <button
+                  onClick={() => markItemStatus(item.orderId, item.itemCode, 'delivered', true)}
+                  className="bg-purple-500 text-white px-2 py-1 rounded text-xs"
+                >
+                  Delivered
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  if (loading) return <div className="p-4">Loading orders...</div>
 
   return (
-    <div className="min-h-screen bg-[#1a1a2e] text-white">
-      <header className="bg-[#16213e] px-6 py-4 flex items-center gap-4 shadow-md">
-        <button onClick={() => navigate('/dashboard')} className="text-gray-400 hover:text-white transition-colors">
-          ← Back
+    <div className="max-w-5xl mx-auto p-4">
+      <h2 className="text-2xl font-bold mb-4">End of Event – Pickup & Delivery</h2>
+
+      {/* Tabs */}
+      <div className="flex gap-2 mb-4">
+        <button
+          onClick={() => setActiveTab('pickup')}
+          className={`px-4 py-2 rounded-t-lg font-medium ${activeTab === 'pickup' ? 'bg-yellow-100 border-b-2 border-yellow-500' : 'bg-gray-100'}`}
+        >
+          📍 Pickup ({pickupGroups.reduce((acc, g) => acc + g.orders.flatMap(o => o.items.filter(i => i.fulfillmentType === 'pickup' && i.status !== 'pickedup')).length, 0)})
         </button>
-        <h1 className="text-xl font-bold">End of Event</h1>
-      </header>
+        <button
+          onClick={() => setActiveTab('delivery')}
+          className={`px-4 py-2 rounded-t-lg font-medium ${activeTab === 'delivery' ? 'bg-purple-100 border-b-2 border-purple-500' : 'bg-gray-100'}`}
+        >
+          🚚 Delivery ({deliveryGroups.reduce((acc, g) => acc + g.orders.flatMap(o => o.items.filter(i => i.fulfillmentType === 'delivery' && i.status !== 'delivered')).length, 0)})
+        </button>
+        <button
+          onClick={() => setActiveTab('search')}
+          className={`px-4 py-2 rounded-t-lg font-medium ${activeTab === 'search' ? 'bg-blue-100 border-b-2 border-blue-500' : 'bg-gray-100'}`}
+        >
+          🔍 Search
+        </button>
+      </div>
 
-      {loading ? (
-        <p className="text-gray-400 text-center mt-12">Loading...</p>
-      ) : !event ? (
-        <p className="text-gray-400 text-center mt-12">No active event found.</p>
-      ) : (
-        <main className="p-6 max-w-lg mx-auto">
-
-          {/* Stats */}
-          <div className="grid grid-cols-2 gap-3 mb-5">
-            <div className="bg-[#16213e] rounded-xl p-3 text-center">
-              <p className="text-2xl font-bold text-yellow-400">{pendingPickup}</p>
-              <p className="text-gray-400 text-xs">Awaiting Pickup</p>
-            </div>
-            <div className="bg-[#16213e] rounded-xl p-3 text-center">
-              <p className="text-2xl font-bold text-blue-400">{pendingDelivery}</p>
-              <p className="text-gray-400 text-xs">Awaiting Delivery</p>
-            </div>
-          </div>
-
-          {/* Tabs */}
-          <div className="flex gap-2 mb-5">
-            <button
-              onClick={() => setActiveTab('pickup')}
-              className={`flex-1 py-3 rounded-xl text-sm font-bold transition-colors ${
-                activeTab === 'pickup' ? 'bg-yellow-500/30 text-yellow-400 border border-yellow-500/50' : 'bg-[#16213e] text-gray-400'
-              }`}
-            >
-              📍 Pickup
-              <span className={`ml-1.5 text-xs px-2 py-0.5 rounded-full ${pendingPickup > 0 ? 'bg-yellow-500/30 text-yellow-300' : 'bg-white/10 text-gray-500'}`}>
-                {pendingPickup}
-              </span>
-            </button>
-            <button
-              onClick={() => setActiveTab('delivery')}
-              className={`flex-1 py-3 rounded-xl text-sm font-bold transition-colors ${
-                activeTab === 'delivery' ? 'bg-blue-500/30 text-blue-400 border border-blue-500/50' : 'bg-[#16213e] text-gray-400'
-              }`}
-            >
-              🚚 Delivery
-              <span className={`ml-1.5 text-xs px-2 py-0.5 rounded-full ${pendingDelivery > 0 ? 'bg-blue-500/30 text-blue-300' : 'bg-white/10 text-gray-500'}`}>
-                {pendingDelivery}
-              </span>
-            </button>
-            <button
-              onClick={() => setActiveTab('search')}
-              className={`px-4 py-3 rounded-xl text-sm font-bold transition-colors ${
-                activeTab === 'search' ? 'bg-purple-600 text-white' : 'bg-[#16213e] text-gray-400'
-              }`}
-            >
-              🔍
-            </button>
-          </div>
-
-          {/* Search input — only visible on search tab */}
-          {activeTab === 'search' && (
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search by name, confirmation #, or phone"
-              className="w-full bg-[#16213e] text-white rounded-xl px-4 py-4 outline-none focus:ring-2 focus:ring-purple-500 text-sm mb-5"
-              autoFocus
-            />
-          )}
-
-          {/* Empty states */}
-          {activeTab === 'pickup' && pickupGroups.length === 0 && (
-            <div className="text-center mt-16">
-              <p className="text-5xl mb-4">✅</p>
-              <p className="text-gray-400 text-sm">All pickups complete!</p>
-            </div>
-          )}
-          {activeTab === 'delivery' && deliveryGroups.length === 0 && (
-            <div className="text-center mt-16">
-              <p className="text-5xl mb-4">✅</p>
-              <p className="text-gray-400 text-sm">All deliveries complete!</p>
-            </div>
-          )}
-          {activeTab === 'search' && !search.trim() && (
-            <div className="text-center mt-16">
-              <p className="text-gray-400 text-sm">Type to search all orders</p>
-              <p className="text-gray-600 text-xs mt-1">Name, confirmation number, or phone</p>
-            </div>
-          )}
-          {activeTab === 'search' && search.trim() && customerGroups.length === 0 && (
-            <p className="text-center text-gray-500 mt-8 text-sm">No customers found.</p>
-          )}
-
-          {/* Customer results */}
-          <div className="space-y-5">
-            {activeGroups.map((group, idx) => {
-              const deliveryOrders = group.orders.filter(o => o.fulfillment_type === 'delivery')
-              const pickupOrders = group.orders.filter(o => o.fulfillment_type === 'pickup')
-              const hasPaidDelivery = deliveryOrders.length > 0
-              const deliveryAddress = hasPaidDelivery ? deliveryOrders[0].delivery_address : null
-
-              return (
-                <div key={idx} className="bg-[#16213e] rounded-2xl overflow-hidden border border-white/5">
-
-                  {/* Customer header */}
-                  <div className="px-4 pt-4 pb-3 border-b border-white/10 flex items-start justify-between">
-                    <div>
-                      <p className="text-white font-bold text-lg leading-tight">{group.name}</p>
-                      {group.phone && <p className="text-gray-400 text-xs mt-0.5">{group.phone}</p>}
-                    </div>
-                    {hasPaidDelivery && (
-                      <span className="shrink-0 ml-3 bg-blue-500/20 text-blue-400 text-xs font-semibold px-2 py-1 rounded-full">
-                        ✓ Delivery Paid
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Delivery section */}
-                  {deliveryOrders.length > 0 && (
-                    <div className="p-4 border-b border-white/5">
-                      <p className="text-blue-400 text-xs font-bold uppercase tracking-widest mb-3">🚚 Delivery</p>
-                      {deliveryAddress && (
-                        <div className="bg-[#0f3460] rounded-lg px-3 py-2 mb-3">
-                          <p className="text-gray-400 text-xs mb-0.5">Deliver to:</p>
-                          <p className="text-white text-sm">{deliveryAddress}</p>
-                        </div>
-                      )}
-                      {deliveryOrders.map(order => (
-                        <div key={order.id} className="mb-4 last:mb-0">
-                          <p className="text-purple-400 text-xs font-mono mb-1.5">#{order.confirmation_number}</p>
-                          <div className="space-y-1 mb-2">
-                            {getOrderItems(order.id).map(item => (
-                              <div key={item.id} className="flex items-center justify-between bg-[#0f3460] rounded-lg px-3 py-2">
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <span className="text-purple-400 text-xs font-mono shrink-0">{item.item_code}</span>
-                                  <span className="text-gray-300 text-xs truncate">{item.description}</span>
-                                </div>
-                                <span className="text-green-400 text-xs font-bold shrink-0 ml-2">${parseFloat(item.price).toFixed(2)}</span>
-                              </div>
-                            ))}
-                          </div>
-                          <div className="flex items-center justify-between">
-                            <p className="text-gray-500 text-xs">Total: <span className="text-white font-semibold">${parseFloat(order.total_amount).toFixed(2)}</span></p>
-                            {order.status === 'delivered' ? (
-                              <span className="text-green-400 text-xs font-semibold">✓ Delivered</span>
-                            ) : (
-                              <button
-                                onClick={() => handleMarkDelivered(order.id)}
-                                disabled={markingId === order.id}
-                                className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
-                              >
-                                {markingId === order.id ? '...' : '✓ Mark Delivered'}
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Pickup section */}
-                  {pickupOrders.length > 0 && (
-                    <div className="p-4">
-                      <p className="text-yellow-400 text-xs font-bold uppercase tracking-widest mb-3">📍 Pickup</p>
-                      {pickupOrders.map(order => (
-                        <div key={order.id} className="mb-4 last:mb-0">
-                          <p className="text-purple-400 text-xs font-mono mb-1.5">#{order.confirmation_number}</p>
-                          <div className="space-y-1 mb-2">
-                            {getOrderItems(order.id).map(item => (
-                              <div key={item.id} className="flex items-center justify-between bg-[#0f3460] rounded-lg px-3 py-2">
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <span className="text-purple-400 text-xs font-mono shrink-0">{item.item_code}</span>
-                                  <span className="text-gray-300 text-xs truncate">{item.description}</span>
-                                </div>
-                                <span className="text-green-400 text-xs font-bold shrink-0 ml-2">${parseFloat(item.price).toFixed(2)}</span>
-                              </div>
-                            ))}
-                          </div>
-                          <div className="flex items-center justify-between gap-2 flex-wrap">
-                            <p className="text-gray-500 text-xs">Total: <span className="text-white font-semibold">${parseFloat(order.total_amount).toFixed(2)}</span></p>
-                            {order.status === 'pickedup' ? (
-                              <span className="text-green-400 text-xs font-semibold">✓ Picked Up</span>
-                            ) : (
-                              <div className="flex gap-2">
-                                {hasPaidDelivery && (
-                                  <button
-                                    onClick={() => handleMoveToDelivery(order.id, deliveryAddress)}
-                                    disabled={markingId === order.id}
-                                    className="bg-blue-500/20 hover:bg-blue-500/40 text-blue-400 text-xs font-bold px-3 py-2 rounded-lg transition-colors disabled:opacity-50"
-                                  >
-                                    🚚 Add to Delivery
-                                  </button>
-                                )}
-                                <button
-                                  onClick={() => handleMarkPickedUp(order.id)}
-                                  disabled={markingId === order.id}
-                                  className="bg-green-600 hover:bg-green-700 text-white text-xs font-bold px-3 py-2 rounded-lg transition-colors disabled:opacity-50"
-                                >
-                                  {markingId === order.id ? '...' : '✓ Picked Up'}
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                </div>
-              )
-            })}
-          </div>
-
-        </main>
+      {/* Search bar (visible only in search tab, but we can keep it there) */}
+      {activeTab === 'search' && (
+        <div className="mb-4">
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Search by name, confirmation #, or phone"
+            className="w-full border rounded px-3 py-2"
+            autoFocus
+          />
+        </div>
       )}
+
+      {/* Lists */}
+      <div>
+        {activeTab === 'pickup' && pickupGroups.map(group => <CustomerCard key={group.customerId || group.customerPhone} group={group} />)}
+        {activeTab === 'delivery' && deliveryGroups.map(group => <CustomerCard key={group.customerId || group.customerPhone} group={group} />)}
+        {activeTab === 'search' && searchResults.map(group => <CustomerCard key={group.customerId || group.customerPhone} group={group} />)}
+        {activeTab === 'search' && searchQuery && searchResults.length === 0 && (
+          <p className="text-gray-500 text-center py-8">No customers match your search.</p>
+        )}
+      </div>
     </div>
   )
 }

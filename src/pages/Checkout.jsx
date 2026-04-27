@@ -1,573 +1,489 @@
-import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+// src/pages/Checkout.jsx   (adjust path if needed)
+import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
-import { useCart } from '../hooks/useCart'
-// import QRScanner from '../components/QRScanner'
-
-const DELIVERY_FEE = 25.00
+import { useEvent } from '../hooks/useEvent'
+import CustomerLookup from '../components/CustomerLookup'
+import { sendReceiptEmail } from '../lib/email'   // your existing email function
 
 export default function Checkout() {
-  const [event, setEvent] = useState(null)
-  const [itemCodeInput, setItemCodeInput] = useState('')
-  const [scanning, setScanning] = useState(false)
-  const [searching, setSearching] = useState(false)
-  const [searchError, setSearchError] = useState(null)
+  const { event } = useEvent()
+  const eventId = event.id
 
-  // Booth assignment
-  const [allBooths, setAllBooths] = useState([])
-  const [assignedBoothIds, setAssignedBoothIds] = useState([])
-  const [availableItems, setAvailableItems] = useState([])
+  // Screen state: 'lookup' | 'cart' | 'address' | 'confirmation'
+  const [screen, setScreen] = useState('lookup')
+  const [customer, setCustomer] = useState(null)
 
-  // Checkout form
-  const [stage, setStage] = useState('cart') // cart | details | confirm
-  const [fulfillment, setFulfillment] = useState('pickup')
-  const [customerName, setCustomerName] = useState('')
-  const [customerPhone, setCustomerPhone] = useState('')
-  const [deliveryAddress, setDeliveryAddress] = useState('')
-  const [confirming, setConfirming] = useState(false)
+  // Cart items: array of { itemCode, description, price, ...itemData, fulfillmentType: 'pickup'|'delivery' }
+  const [cart, setCart] = useState([])
+  const [scanInput, setScanInput] = useState('')
+  const [scanError, setScanError] = useState('')
+
+  // Address form
+  const [address, setAddress] = useState({ street: '', city: '', zip: '' })
+  const [addressError, setAddressError] = useState('')
+
+  // Confirmation state
   const [confirmation, setConfirmation] = useState(null)
-  const [deliveryAlreadyPaid, setDeliveryAlreadyPaid] = useState(false)
-  const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
 
-  const navigate = useNavigate()
+  // Delivery fee paid banner
+  const deliveryPaid = customer?.delivery_fee_paid === true
+  const hasDeliveryItems = cart.some(item => item.fulfillmentType === 'delivery')
+  const needsDeliveryFee = hasDeliveryItems && !deliveryPaid
+  const subtotal = cart.reduce((sum, item) => sum + Number(item.price), 0)
+  const total = needsDeliveryFee ? subtotal + 25 : subtotal
 
-  // Get current user ID for the cart hook
-  const [userId, setUserId] = useState(null)
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setUserId(data?.session?.user?.id || null)
-    })
-  }, [])
-
-  const { cartItems, addToCart, removeFromCart, completeSale, clearCart } = useCart(event?.id, userId)
-
-  useEffect(() => {
-    fetchEvent()
-  }, [])
-
-  const fetchEvent = async () => {
-    const { data } = await supabase
-      .from('events')
-      .select('*')
-      .eq('status', 'active')
-      .single()
-    setEvent(data)
-    if (data) fetchAllBooths(data.id)
-  }
-
-  const fetchAllBooths = async (eventId) => {
-    const { data } = await supabase
-      .from('booths')
-      .select('id, designer_name, booth_number')
-      .eq('event_id', eventId)
-    setAllBooths(data || [])
-  }
-
-  // Fetch available items for assigned booths
-  useEffect(() => {
-    if (!event || assignedBoothIds.length === 0) {
-      setAvailableItems([])
-      return
-    }
-    const fetchItems = async () => {
-      const { data } = await supabase
-        .from('items')
-        .select('*')
-        .eq('event_id', event.id)
-        .eq('status', 'available')
-        .in('booth_id', assignedBoothIds)
-      setAvailableItems(data || [])
-    }
-    fetchItems()
-  }, [assignedBoothIds, event])
-
-  const toggleBooth = (id) => {
-    setAssignedBoothIds(prev =>
-      prev.includes(id) ? prev.filter(b => b !== id) : [...prev, id]
-    )
-  }
-
-  const checkExistingDelivery = async (phone) => {
-    if (!phone || phone.trim().length < 7 || !event) {
-      setDeliveryAlreadyPaid(false)
-      setExistingDeliveryAddress('')
-      return
-    }
-    const digits = phone.replace(/\D/g, '')
-    const { data } = await supabase
-      .from('orders')
-      .select('delivery_address, customer_phone')
-      .eq('event_id', event.id)
-      .eq('fulfillment_type', 'delivery')
-    
-    const match = (data || []).find(o => {
-      const oDigits = (o.customer_phone || '').replace(/\D/g, '')
-      return oDigits.slice(-7) === digits.slice(-7)
-    })
-
-    if (match) {
-      setDeliveryAlreadyPaid(true)
-      setExistingDeliveryAddress(match.delivery_address || '')
-      if (!deliveryAddress) setDeliveryAddress(match.delivery_address || '')
-    } else {
-      setDeliveryAlreadyPaid(false)
-      setExistingDeliveryAddress('')
-    }
-  }
-
-  const handleAddByCode = async (code) => {
-    const cleanCode = code.trim().toUpperCase()
-    if (!cleanCode) return
-
-    setSearching(true)
-    setSearchError(null)
-
-    // Use .eq with a direct match (avoids ilike content-type issues)
-    const { data, error } = await supabase
-      .from('items')
-      .select('*')
-      .eq('event_id', event.id)
-      .eq('item_code', cleanCode)
-      .eq('status', 'available')
-      .single()
-
-    if (error || !data) {
-      setSearchError('Item not found or already sold.')
-      setSearching(false)
-      return
-    }
-
-    // Check if already in cart
-    if (cartItems.find(i => i.id === data.id)) {
-      setSearchError('Item already in cart.')
-      setSearching(false)
-      return
-    }
-
-    // Add to server-side cart
-    const addErr = await addToCart(data.id)
-    if (addErr) {
-      setSearchError('Could not add item (maybe just sold).')
-    } else {
-      setItemCodeInput('')
-    }
-    setSearching(false)
-  }
-
-  const handleQRScan = (text) => {
-    setScanning(false)
-    handleAddByCode(text)
-  }
-
-  const itemsTotal = cartItems.reduce((sum, item) => sum + parseFloat(item.price), 0)
-  const deliveryFee = fulfillment === 'delivery' && !deliveryAlreadyPaid ? DELIVERY_FEE : 0
-  const grandTotal = itemsTotal + deliveryFee
-
-  const handleConfirmSale = async () => {
-    if (!customerName.trim()) return
-    if (fulfillment === 'delivery' && !deliveryAddress.trim()) return
-
-    setConfirming(true)
-
-    // Re-check delivery fee to avoid double charges
-    let finalDeliveryFee = deliveryFee
-    if (fulfillment === 'delivery') {
-      const digits = customerPhone.replace(/\D/g, '').slice(-7)
-      const { data: existingOrders } = await supabase
-        .from('orders')
-        .select('id, customer_phone')
-        .eq('event_id', event.id)
-        .eq('fulfillment_type', 'delivery')
-
-      const alreadyPaid = (existingOrders || []).some(o =>
-        o.customer_phone &&
-        o.customer_phone.replace(/\D/g, '').slice(-7) === digits
-      )
-      if (alreadyPaid) {
-        finalDeliveryFee = 0
-        setDeliveryAlreadyPaid(true)
-      }
-    }
-
-    const confirmedTotal = itemsTotal + finalDeliveryFee
-
-    try {
-      const result = await completeSale(
-        customerName.trim(),
-        customerPhone.trim() || '',
-        fulfillment,
-        confirmedTotal
-      )
-
-      if (!result.success) {
-        alert(result.error + ': ' + (result.failed_items || []).join(', '))
-        setConfirming(false)
-        return
-      }
-
-      setConfirmation({
-        number: result.confirmation_number,
-        name: customerName.trim(),
-        itemCount: cartItems.length,
-        fulfillment,
-        total: confirmedTotal
-      })
-
-      setStage('confirm')
-    } catch (err) {
-      alert('An error occurred. Please try again.')
-      console.error(err)
-    }
-    setConfirming(false)
-  }
-
-  const startNewSale = async () => {
-    await clearCart()
-    setItemCodeInput('')
-    setCustomerName('')
-    setCustomerPhone('')
-    setDeliveryAddress('')
-    setFulfillment('pickup')
+  // Reset everything when starting new customer
+  const startNewCustomer = () => {
+    setScreen('lookup')
+    setCustomer(null)
+    setCart([])
+    setScanInput('')
+    setScanError('')
     setConfirmation(null)
-    setStage('cart')
-    setSearchError(null)
   }
 
-  // Real-time: remove sold items from available list
-  useEffect(() => {
-    if (!event) return
-    const subscription = supabase
-      .channel('items-sold')
-      .on('postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'items', filter: `event_id=eq.${event.id}` },
-        (payload) => {
-          if (payload.new.status === 'sold') {
-            setAvailableItems(prev => prev.filter(i => i.id !== payload.new.id))
-          }
+  // Handle customer identification from lookup component
+  const handleCustomerIdentified = (customerData) => {
+    setCustomer(customerData)
+    setScreen('cart')
+    setCart([])
+  }
+
+  // Add item to cart by scanning or typing item code
+  const addItemToCart = async (code) => {
+    if (!code) return
+    setScanError('')
+    // Fetch item from database
+    const { data: item, error } = await supabase
+      .from('items')
+      .select('id, item_code, booth_number, description, price, status')
+      .eq('event_id', eventId)
+      .eq('item_code', code.toUpperCase())
+      .maybeSingle()
+
+    if (error || !item) {
+      setScanError('Item not found: ' + code)
+      return
+    }
+    if (item.status === 'sold') {
+      setScanError('Item already sold')
+      return
+    }
+    // Check if already in cart
+    if (cart.find(i => i.itemCode === item.item_code)) {
+      setScanError('Already in cart')
+      return
+    }
+    setCart(prev => [...prev, {
+      itemCode: item.item_code,
+      description: item.description,
+      price: item.price,
+      boothNumber: item.booth_number,
+      itemId: item.id,
+      fulfillmentType: 'pickup'   // default
+    }])
+  }
+
+  const handleScanSubmit = (e) => {
+    e.preventDefault()
+    const code = scanInput.trim()
+    if (code) addItemToCart(code)
+    setScanInput('')
+  }
+
+  // Toggle fulfillment type for a cart item
+  const toggleFulfillment = (itemCode) => {
+    setCart(prev => prev.map(item =>
+      item.itemCode === itemCode
+        ? { ...item, fulfillmentType: item.fulfillmentType === 'delivery' ? 'pickup' : 'delivery' }
+        : item
+    ))
+  }
+
+  // Proceed from cart to address collection (if needed) or directly to sale
+  const handleProceedToCheckout = () => {
+    if (hasDeliveryItems && !deliveryPaid) {
+      // Need address
+      setScreen('address')
+      // Pre-fill if customer previously had address
+      if (customer.address) {
+        setAddress(customer.address)
+      }
+    } else {
+      // No address needed or delivery fee already paid
+      confirmSale(null)  // no new address needed
+    }
+  }
+
+  // Final sale confirmation
+  const confirmSale = async (newAddress) => {
+    const deliveryItems = cart.filter(i => i.fulfillmentType === 'delivery')
+    const pickupItems = cart.filter(i => i.fulfillmentType === 'pickup')
+    const allItemsArray = cart.map(i => ({
+      itemCode: i.itemCode,
+      description: i.description,
+      price: i.price,
+      boothNumber: i.boothNumber,
+      fulfillmentType: i.fulfillmentType
+    }))
+
+    let finalAddress = null
+    if (deliveryItems.length > 0) {
+      if (deliveryPaid) {
+        finalAddress = customer.address   // reuse stored address
+      } else {
+        if (!newAddress || !newAddress.street || !newAddress.city || !newAddress.zip) {
+          setAddressError('Full address is required for delivery.')
+          return
         }
-      )
-      .subscribe()
+        finalAddress = newAddress
+      }
+    }
 
-    return () => { supabase.removeChannel(subscription) }
-  }, [event])
+    // Hard gate: double-check delivery fee not already paid (race condition safety)
+    if (deliveryItems.length > 0 && !deliveryPaid) {
+      const { data: freshCust } = await supabase
+        .from('customers')
+        .select('delivery_fee_paid')
+        .eq('id', customer.id)
+        .single()
+      if (freshCust?.delivery_fee_paid) {
+        // Race condition – fee was paid between screens
+        alert('Delivery fee was just paid by another cashier. Fee waived.')
+        // proceed without fee but with address already stored
+        finalAddress = freshCust.address || finalAddress
+        // update local state
+        setCustomer({ ...customer, delivery_fee_paid: true, address: finalAddress })
+        // continue as if fee already paid
+      }
+    }
 
-  // CONFIRMATION SCREEN
-  if (stage === 'confirm' && confirmation) {
-    return (
-      <div className="min-h-screen bg-[#1a1a2e] flex flex-col items-center justify-center p-6">
-        <div className="w-full max-w-sm bg-[#16213e] rounded-3xl p-8 text-center shadow-2xl border border-purple-500/30">
-          <div className="text-5xl mb-4">✅</div>
-          <p className="text-green-400 font-semibold text-sm mb-2">PURCHASE CONFIRMED</p>
+    // Insert order
+    const orderData = {
+      event_id: eventId,
+      customer_id: customer.id,
+      customerName: customer.name,
+      customerEmail: customer.email || null,
+      customerPhone: customer.phone,
+      items: allItemsArray,
+      totalAmount: total,
+      deliveryAddress: finalAddress,
+      status: 'sold',
+      confirmationNumber: generateConfirmation(), // you have a function for this
+    }
 
-          <div className="bg-[#0f3460] rounded-2xl py-6 px-4 my-6">
-            <p className="text-gray-400 text-xs mb-2">Confirmation Number</p>
-            <p className="text-white text-5xl font-black tracking-widest">
-              {confirmation.number}
-            </p>
-          </div>
+    const { data: order, error } = await supabase
+      .from('orders')
+      .insert(orderData)
+      .select()
+      .single()
 
-          <p className="text-white text-xl font-bold mb-1">{confirmation.name}</p>
-          <p className="text-gray-400 text-sm mb-1">
-            {confirmation.itemCount} item{confirmation.itemCount !== 1 ? 's' : ''}
-          </p>
-          <p className="text-green-400 font-bold text-lg mb-2">
-            ${confirmation.total.toFixed(2)}
-          </p>
-          <span className={`inline-block text-xs px-3 py-1 rounded-full mb-6 ${
-            confirmation.fulfillment === 'delivery'
-              ? 'bg-blue-500/20 text-blue-400'
-              : 'bg-purple-500/20 text-purple-400'
-          }`}>
-            {confirmation.fulfillment === 'delivery' ? '🚚 Delivery' : '📍 Pickup Saturday'}
-          </span>
+    if (error) {
+      alert('Failed to save order: ' + error.message)
+      return
+    }
 
-          <p className="text-yellow-400 text-sm font-semibold mb-6">
-            📸 Ask customer to screenshot this screen
-          </p>
+    // Mark all items as sold
+    const itemIds = cart.map(i => i.itemId)
+    await supabase
+      .from('items')
+      .update({ status: 'sold', order_id: order.id })
+      .in('id', itemIds)
 
-          <button
-            onClick={startNewSale}
-            className="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-4 rounded-xl transition-colors text-lg"
-          >
-            New Sale
-          </button>
-        </div>
-      </div>
-    )
+    // If delivery and fee not yet paid, update customer
+    if (deliveryItems.length > 0 && !deliveryPaid) {
+      await supabase
+        .from('customers')
+        .update({
+          delivery_fee_paid: true,
+          address: finalAddress
+        })
+        .eq('id', customer.id)
+    }
+
+    // Send email receipt if customer has email
+    if (customer.email) {
+      sendReceiptEmail(order, customer.email)
+    }
+
+    setConfirmation(order)
+    setScreen('confirmation')
   }
 
-  // DETAILS SCREEN
-  if (stage === 'details') {
-    return (
-      <div className="min-h-screen bg-[#1a1a2e] text-white">
-        <header className="bg-[#16213e] px-6 py-4 flex items-center gap-4 shadow-md">
-          <button onClick={() => setStage('cart')} className="text-gray-400 hover:text-white transition-colors">
-            ← Back
-          </button>
-          <h1 className="text-xl font-bold">Customer Details</h1>
-        </header>
-
-        <main className="p-6 max-w-lg mx-auto space-y-4">
-
-          {/* Fulfillment Toggle */}
-          <div className="bg-[#16213e] rounded-2xl p-4">
-            <p className="text-gray-400 text-xs mb-3">Fulfillment Method</p>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                onClick={() => { setFulfillment('pickup'); setDeliveryAlreadyPaid(false) }}
-                className={`py-3 rounded-xl font-semibold text-sm transition-colors ${
-                  fulfillment === 'pickup'
-                    ? 'bg-purple-600 text-white'
-                    : 'bg-[#0f3460] text-gray-400'
-                }`}
-              >
-                📍 Pickup
-                <p className="text-xs font-normal opacity-70">Saturday 2pm</p>
-              </button>
-              <button
-                onClick={() => { setFulfillment('delivery'); checkExistingDelivery(customerPhone) }}
-                className={`py-3 rounded-xl font-semibold text-sm transition-colors ${
-                  fulfillment === 'delivery'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-[#0f3460] text-gray-400'
-                }`}
-              >
-                🚚 Delivery
-                <p className="text-xs font-normal opacity-70">+$25.00 fee</p>
-              </button>
-            </div>
-          </div>
-
-          {/* Customer Info */}
-          <div className="bg-[#16213e] rounded-2xl p-4 space-y-3">
-            <p className="text-gray-400 text-xs">Customer Information</p>
-            <div>
-              <label className="text-gray-400 text-xs mb-1 block">Full Name *</label>
-              <input
-                type="text"
-                value={customerName}
-                onChange={(e) => setCustomerName(e.target.value)}
-                placeholder="Jane Smith"
-                className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-purple-500 text-sm"
-              />
-            </div>
-            <div>
-              <label className="text-gray-400 text-xs mb-1 block">
-                Phone Number {fulfillment === 'delivery' ? <span className="text-red-400">*</span> : '(optional)'}
-              </label>
-              <input
-                type="tel"
-                value={customerPhone}
-                onChange={(e) => {
-                  setCustomerPhone(e.target.value)
-                  if (fulfillment === 'delivery') checkExistingDelivery(e.target.value)
-                }}
-                placeholder="910-555-0100"
-                className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-purple-500 text-sm"
-              />
-            </div>
-            {fulfillment === 'delivery' && deliveryAlreadyPaid && (
-              <div className="bg-blue-500/20 border border-blue-500/40 rounded-lg px-3 py-2">
-                <p className="text-blue-300 text-xs font-semibold">✓ Delivery already paid — no additional fee</p>
-                {existingDeliveryAddress && (
-                  <p className="text-blue-400 text-xs mt-0.5">Using address on file: {existingDeliveryAddress}</p>
-                )}
-              </div>
-            )}
-            {fulfillment === 'delivery' && (
-              <div>
-                <label className="text-gray-400 text-xs mb-1 block">Delivery Address *</label>
-                <textarea
-                  value={deliveryAddress}
-                  onChange={(e) => setDeliveryAddress(e.target.value)}
-                  placeholder="123 Main St, Wilmington, NC 28401"
-                  rows={2}
-                  className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-purple-500 text-sm resize-none"
-                />
-              </div>
-            )}
-          </div>
-
-          {/* Order Summary */}
-          <div className="bg-[#16213e] rounded-2xl p-4">
-            <p className="text-gray-400 text-xs mb-3">Order Summary</p>
-            <div className="space-y-1 mb-3">
-              {cartItems.map(item => (
-                <div key={item.id} className="flex justify-between text-sm">
-                  <span className="text-gray-300">{item.item_code} — {item.description}</span>
-                  <span className="text-white">${parseFloat(item.price).toFixed(2)}</span>
-                </div>
-              ))}
-              {fulfillment === 'delivery' && (
-                <div className="flex justify-between text-sm">
-                  <span className="text-blue-400">Delivery Fee</span>
-                  <span className="text-blue-400">$25.00</span>
-                </div>
-              )}
-            </div>
-            <div className="border-t border-white/10 pt-3 flex justify-between">
-              <span className="text-white font-bold">Total</span>
-              <span className="text-green-400 font-bold text-lg">${grandTotal.toFixed(2)}</span>
-            </div>
-            <p className="text-yellow-400 text-xs mt-3 text-center">
-              ⚠️ Ring up ${grandTotal.toFixed(2)} in Zettle before confirming
-            </p>
-          </div>
-
-          <button
-            onClick={handleConfirmSale}
-            disabled={confirming || !customerName.trim() || (fulfillment === 'delivery' && !deliveryAddress.trim()) || (fulfillment === 'delivery' && !customerPhone.trim())}
-            className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-4 rounded-xl transition-colors disabled:opacity-50 text-lg"
-          >
-            {confirming ? 'Processing...' : '✓ Confirm Sale'}
-          </button>
-        </main>
-      </div>
-    )
+  // Address form submission
+  const handleAddressSubmit = (e) => {
+    e.preventDefault()
+    if (!address.street || !address.city || !address.zip) {
+      setAddressError('All address fields are required.')
+      return
+    }
+    setAddressError('')
+    confirmSale(address)
   }
 
-  // CART SCREEN (default)
-  return (
-    <div className="min-h-screen bg-[#1a1a2e] text-white">
-      {/* scanning && (
-        <QRScanner
-          onScan={handleQRScan}
-          onClose={() => setScanning(false)}
-        />
-      ) */}
+  // Helper: generate a short confirmation number (you may already have one)
+  const generateConfirmation = () => {
+    return Math.random().toString(36).substring(2, 6).toUpperCase()
+  }
 
-      <header className="bg-[#16213e] px-6 py-4 flex items-center gap-4 shadow-md">
-        <button onClick={() => navigate('/dashboard')} className="text-gray-400 hover:text-white transition-colors">
-          ← Back
+  // Edit customer info (name, phone, email) – inline modal or simple form
+  const [showEditCustomer, setShowEditCustomer] = useState(false)
+  const [editName, setEditName] = useState('')
+  const [editPhone, setEditPhone] = useState('')
+  const [editEmail, setEditEmail] = useState('')
+
+  const openEditCustomer = () => {
+    setEditName(customer.name)
+    setEditPhone(customer.phone)
+    setEditEmail(customer.email || '')
+    setShowEditCustomer(true)
+  }
+
+  const saveEditCustomer = async () => {
+    if (!editName.trim()) return
+    const updates = {
+      name: editName.trim(),
+      phone: editPhone.replace(/\D/g, ''),
+      email: editEmail.trim() || null
+    }
+    const { error } = await supabase
+      .from('customers')
+      .update(updates)
+      .eq('id', customer.id)
+
+    if (error) {
+      alert('Failed to update: ' + error.message)
+    } else {
+      setCustomer({ ...customer, ...updates })
+      setShowEditCustomer(false)
+    }
+  }
+
+  // ---------------- RENDER -----------------
+  if (screen === 'lookup') {
+    return <CustomerLookup onCustomerIdentified={handleCustomerIdentified} />
+  }
+
+  if (screen === 'confirmation') {
+    return (
+      <div className="max-w-md mx-auto p-4 text-center">
+        <h2 className="text-2xl font-bold mb-2">Order Confirmed!</h2>
+        <p className="text-lg">Confirmation #: <strong>{confirmation.confirmationNumber}</strong></p>
+        <p className="text-sm text-gray-500 mt-4">You can now help the next customer.</p>
+        <button
+          onClick={startNewCustomer}
+          className="mt-6 w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700"
+        >
+          Start New Customer
         </button>
-        <h1 className="text-xl font-bold">Checkout</h1>
-        {cartItems.length > 0 && (
-          <span className="ml-auto bg-purple-600 text-white text-xs font-bold px-2 py-1 rounded-full">
-            {cartItems.length} item{cartItems.length !== 1 ? 's' : ''}
-          </span>
-        )}
-      </header>
+      </div>
+    )
+  }
 
-      <main className="p-6 max-w-lg mx-auto">
+  // Cart Screen
+  return (
+    <div className="max-w-4xl mx-auto p-4">
+      {/* Customer info header */}
+      <div className="flex justify-between items-center mb-4">
+        <div>
+          <h2 className="text-xl font-bold">{customer.name}</h2>
+          <p className="text-gray-600">{customer.phone}</p>
+        </div>
+        <button onClick={openEditCustomer} className="text-blue-600 underline text-sm">
+          Edit Info
+        </button>
+      </div>
 
-        {/* Booth Selection */}
-        {allBooths.length > 0 && (
-          <div className="mb-4">
-            <p className="text-gray-400 text-xs mb-2">My Booths</p>
-            <div className="flex flex-wrap gap-2">
-              {allBooths.map(booth => (
-                <button
-                  key={booth.id}
-                  onClick={() => toggleBooth(booth.id)}
-                  className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                    assignedBoothIds.includes(booth.id)
-                      ? 'bg-purple-600 text-white'
-                      : 'bg-[#16213e] text-gray-400'
-                  }`}
-                >
-                  {booth.designer_name || `Booth ${booth.booth_number}`}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Available Items Grid (if booths selected) */}
-        {assignedBoothIds.length > 0 && availableItems.length > 0 && (
-          <div className="mb-4">
-            <p className="text-gray-400 text-xs mb-2">Quick Add</p>
-            <div className="grid grid-cols-2 gap-2">
-              {availableItems.map(item => (
-                <button
-                  key={item.id}
-                  onClick={() => addToCart(item.id)}
-                  className="bg-[#16213e] p-2 rounded-lg text-left hover:bg-purple-600/20 transition-colors"
-                >
-                  <p className="text-purple-400 text-xs font-mono">{item.item_code}</p>
-                  <p className="text-white text-xs truncate">{item.description}</p>
-                  <p className="text-green-400 text-xs font-bold">${parseFloat(item.price).toFixed(2)}</p>
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Item Search */}
-        <div className="bg-[#16213e] rounded-2xl p-4 mb-4">
-          <p className="text-gray-400 text-xs mb-3">Add Item to Cart</p>
-          <div className="flex gap-2 mb-2">
-            <input
-              type="text"
-              value={itemCodeInput}
-              onChange={(e) => setItemCodeInput(e.target.value.toUpperCase())}
-              onKeyDown={(e) => e.key === 'Enter' && handleAddByCode(itemCodeInput)}
-              placeholder="e.g. 6-2"
-              className="flex-1 bg-[#0f3460] text-white rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-purple-500 text-sm font-mono"
-            />
-            <button
-              onClick={() => handleAddByCode(itemCodeInput)}
-              disabled={searching || !itemCodeInput}
-              className="bg-purple-600 hover:bg-purple-700 text-white font-semibold px-4 py-3 rounded-lg transition-colors disabled:opacity-50 text-sm"
-            >
-              {searching ? '...' : 'Add'}
-            </button>
-            <button
-              onClick={() => setScanning(true)}
-              className="bg-[#0f3460] hover:bg-purple-600/30 text-white px-4 py-3 rounded-lg transition-colors text-lg"
-            >
-              📷
-            </button>
-          </div>
-          {searchError && (
-            <p className="text-red-400 text-xs mt-1">{searchError}</p>
+      {deliveryPaid && (
+        <div className="bg-yellow-100 border-l-4 border-yellow-500 p-4 mb-4">
+          <p className="font-bold">✅ DELIVERY FEE ALREADY PAID</p>
+          {customer.address && (
+            <p className="text-sm mt-1">
+              📍 {customer.address.street}, {customer.address.city}, {customer.address.zip}
+            </p>
           )}
         </div>
+      )}
 
-        {/* Cart Items */}
-        {cartItems.length > 0 ? (
-          <>
-            <div className="space-y-2 mb-4">
-              {cartItems.map(item => (
-                <div key={item.id} className="bg-[#16213e] rounded-xl p-4 flex items-center justify-between">
-                  <div>
-                    <p className="text-purple-400 text-xs font-mono">{item.item_code}</p>
-                    <p className="text-white text-sm font-medium">{item.description}</p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <p className="text-green-400 font-bold">${parseFloat(item.price).toFixed(2)}</p>
-                    <button
-                      onClick={() => removeFromCart(item.id)}
-                      className="text-red-400 hover:text-red-300 text-lg leading-none"
-                    >
-                      ×
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
+      {/* Scan / add item */}
+      <form onSubmit={handleScanSubmit} className="flex gap-2 mb-4">
+        <input
+          type="text"
+          value={scanInput}
+          onChange={(e) => setScanInput(e.target.value.toUpperCase())}
+          placeholder="Scan QR or type item code"
+          className="flex-1 border rounded px-3 py-2"
+          autoFocus
+        />
+        <button
+          type="submit"
+          className="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700"
+        >
+          Add
+        </button>
+      </form>
+      {scanError && <p className="text-red-600 text-sm mb-2">{scanError}</p>}
 
-            {/* Total Bar */}
-            <div className="bg-[#16213e] rounded-2xl p-4 mb-4 flex items-center justify-between">
-              <div>
-                <p className="text-gray-400 text-xs">Items Total</p>
-                <p className="text-white font-bold text-lg">${itemsTotal.toFixed(2)}</p>
+      {/* Cart items */}
+      {cart.length === 0 ? (
+        <p className="text-gray-500 italic text-center py-8">Cart is empty. Scan an item to begin.</p>
+      ) : (
+        <div className="space-y-2">
+          {cart.map(item => (
+            <div key={item.itemCode} className="flex items-center justify-between border p-2 rounded">
+              <div className="flex-1">
+                <p className="font-medium">{item.itemCode} – {item.description}</p>
+                <p className="text-sm text-gray-500">${Number(item.price).toFixed(2)}</p>
               </div>
-              <button
-                onClick={() => setStage('details')}
-                className="bg-green-600 hover:bg-green-700 text-white font-bold px-6 py-3 rounded-xl transition-colors"
-              >
-                Checkout →
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => toggleFulfillment(item.itemCode)}
+                  className={`flex items-center px-3 py-1 rounded-full text-xs font-medium ${
+                    item.fulfillmentType === 'delivery'
+                      ? 'bg-purple-100 text-purple-800'
+                      : 'bg-gray-100 text-gray-800'
+                  }`}
+                  title="Toggle pickup/delivery"
+                >
+                  {item.fulfillmentType === 'delivery' ? '🚚 Delivery' : '📍 Pickup'}
+                </button>
+                <button
+                  onClick={() => setCart(prev => prev.filter(i => i.itemCode !== item.itemCode))}
+                  className="text-red-500 hover:text-red-700 ml-2"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
-          </>
-        ) : (
-          <div className="text-center mt-12">
-            <p className="text-4xl mb-3">🛒</p>
-            <p className="text-gray-400 text-sm">Cart is empty.</p>
-            <p className="text-gray-600 text-xs mt-1">Scan a QR code or type an item code above.</p>
+          ))}
+
+          <div className="border-t pt-3 mt-4 text-right">
+            <p className="text-lg">
+              Subtotal: <strong>${subtotal.toFixed(2)}</strong>
+            </p>
+            {needsDeliveryFee && (
+              <p className="text-sm text-purple-700">+ $25.00 delivery fee</p>
+            )}
+            <p className="text-2xl font-bold mt-1">Total: ${total.toFixed(2)}</p>
           </div>
-        )}
-      </main>
+
+          <button
+            onClick={handleProceedToCheckout}
+            className="w-full bg-blue-600 text-white py-3 rounded text-lg mt-4 hover:bg-blue-700"
+          >
+            Checkout
+          </button>
+        </div>
+      )}
+
+      {/* Address modal (shown when screen === 'address') */}
+      {screen === 'address' && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 w-full max-w-md">
+            <h3 className="text-xl font-bold mb-4">Delivery Address</h3>
+            <form onSubmit={handleAddressSubmit} className="space-y-3">
+              <div>
+                <label className="block text-sm font-medium mb-1">Street *</label>
+                <input
+                  type="text"
+                  value={address.street}
+                  onChange={(e) => setAddress(prev => ({ ...prev, street: e.target.value }))}
+                  className="w-full border rounded px-3 py-2"
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">City *</label>
+                <input
+                  type="text"
+                  value={address.city}
+                  onChange={(e) => setAddress(prev => ({ ...prev, city: e.target.value }))}
+                  className="w-full border rounded px-3 py-2"
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Zip *</label>
+                <input
+                  type="text"
+                  value={address.zip}
+                  onChange={(e) => setAddress(prev => ({ ...prev, zip: e.target.value }))}
+                  className="w-full border rounded px-3 py-2"
+                  required
+                />
+              </div>
+              {addressError && <p className="text-red-600 text-sm">{addressError}</p>}
+              <div className="flex gap-2">
+                <button
+                  type="submit"
+                  className="flex-1 bg-green-600 text-white py-2 rounded hover:bg-green-700"
+                >
+                  Confirm & Pay ${total.toFixed(2)}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setScreen('cart')}
+                  className="flex-1 bg-gray-300 py-2 rounded hover:bg-gray-400"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Customer modal */}
+      {showEditCustomer && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 w-full max-w-md">
+            <h3 className="text-xl font-bold mb-4">Edit Customer</h3>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm font-medium mb-1">Name</label>
+                <input
+                  type="text"
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  className="w-full border rounded px-3 py-2"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Phone</label>
+                <input
+                  type="tel"
+                  value={editPhone}
+                  onChange={(e) => setEditPhone(e.target.value)}
+                  className="w-full border rounded px-3 py-2"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Email (optional)</label>
+                <input
+                  type="email"
+                  value={editEmail}
+                  onChange={(e) => setEditEmail(e.target.value)}
+                  className="w-full border rounded px-3 py-2"
+                />
+              </div>
+              <div className="flex gap-2 mt-4">
+                <button
+                  onClick={saveEditCustomer}
+                  className="flex-1 bg-blue-600 text-white py-2 rounded hover:bg-blue-700"
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => setShowEditCustomer(false)}
+                  className="flex-1 bg-gray-300 py-2 rounded hover:bg-gray-400"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
