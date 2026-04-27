@@ -1,25 +1,22 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
+import { useCart } from '../hooks/useCart'
 // import QRScanner from '../components/QRScanner'
 
 const DELIVERY_FEE = 25.00
 
-function generateConfirmationNumber() {
-  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
-  const letter = letters[Math.floor(Math.random() * letters.length)]
-  const number = Math.floor(10 + Math.random() * 90)
-  const number2 = Math.floor(10 + Math.random() * 90)
-  return `${letter}${number}${number2}`
-}
-
 export default function Checkout() {
   const [event, setEvent] = useState(null)
-  const [cart, setCart] = useState([])
   const [itemCodeInput, setItemCodeInput] = useState('')
   const [scanning, setScanning] = useState(false)
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState(null)
+
+  // Booth assignment
+  const [allBooths, setAllBooths] = useState([])
+  const [assignedBoothIds, setAssignedBoothIds] = useState([])
+  const [availableItems, setAvailableItems] = useState([])
 
   // Checkout form
   const [stage, setStage] = useState('cart') // cart | details | confirm
@@ -27,12 +24,22 @@ export default function Checkout() {
   const [customerName, setCustomerName] = useState('')
   const [customerPhone, setCustomerPhone] = useState('')
   const [deliveryAddress, setDeliveryAddress] = useState('')
-const [confirming, setConfirming] = useState(false)
-const [confirmation, setConfirmation] = useState(null)
-const [deliveryAlreadyPaid, setDeliveryAlreadyPaid] = useState(false)
-const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
+  const [confirming, setConfirming] = useState(false)
+  const [confirmation, setConfirmation] = useState(null)
+  const [deliveryAlreadyPaid, setDeliveryAlreadyPaid] = useState(false)
+  const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
 
   const navigate = useNavigate()
+
+  // Get current user ID for the cart hook
+  const [userId, setUserId] = useState(null)
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setUserId(data?.session?.user?.id || null)
+    })
+  }, [])
+
+  const { cartItems, addToCart, removeFromCart, completeSale, clearCart } = useCart(event?.id, userId)
 
   useEffect(() => {
     fetchEvent()
@@ -45,6 +52,39 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
       .eq('status', 'active')
       .single()
     setEvent(data)
+    if (data) fetchAllBooths(data.id)
+  }
+
+  const fetchAllBooths = async (eventId) => {
+    const { data } = await supabase
+      .from('booths')
+      .select('id, designer_name, booth_number')
+      .eq('event_id', eventId)
+    setAllBooths(data || [])
+  }
+
+  // Fetch available items for assigned booths
+  useEffect(() => {
+    if (!event || assignedBoothIds.length === 0) {
+      setAvailableItems([])
+      return
+    }
+    const fetchItems = async () => {
+      const { data } = await supabase
+        .from('items')
+        .select('*')
+        .eq('event_id', event.id)
+        .eq('status', 'available')
+        .in('booth_id', assignedBoothIds)
+      setAvailableItems(data || [])
+    }
+    fetchItems()
+  }, [assignedBoothIds, event])
+
+  const toggleBooth = (id) => {
+    setAssignedBoothIds(prev =>
+      prev.includes(id) ? prev.filter(b => b !== id) : [...prev, id]
+    )
   }
 
   const checkExistingDelivery = async (phone) => {
@@ -56,30 +96,19 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
     const digits = phone.replace(/\D/g, '')
     const { data } = await supabase
       .from('orders')
-      .select('delivery_address')
+      .select('delivery_address, customer_phone')
       .eq('event_id', event.id)
       .eq('fulfillment_type', 'delivery')
     
     const match = (data || []).find(o => {
-      const oDigits = (o.delivery_address || '')
-      // match by phone stored in orders
-      return false // placeholder — see below
+      const oDigits = (o.customer_phone || '').replace(/\D/g, '')
+      return oDigits.slice(-7) === digits.slice(-7)
     })
 
-    // Actually query by phone directly
-    const { data: phoneMatch } = await supabase
-      .from('orders')
-      .select('delivery_address')
-      .eq('event_id', event.id)
-      .eq('fulfillment_type', 'delivery')
-      .ilike('customer_phone', `%${digits.slice(-7)}%`)
-      .limit(1)
-      .single()
-
-    if (phoneMatch) {
+    if (match) {
       setDeliveryAlreadyPaid(true)
-      setExistingDeliveryAddress(phoneMatch.delivery_address || '')
-      if (!deliveryAddress) setDeliveryAddress(phoneMatch.delivery_address || '')
+      setExistingDeliveryAddress(match.delivery_address || '')
+      if (!deliveryAddress) setDeliveryAddress(match.delivery_address || '')
     } else {
       setDeliveryAlreadyPaid(false)
       setExistingDeliveryAddress('')
@@ -93,28 +122,35 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
     setSearching(true)
     setSearchError(null)
 
-    // Check not already in cart
-    if (cart.find(i => i.item_code.toUpperCase() === cleanCode)) {
-      setSearchError('Item already in cart.')
-      setSearching(false)
-      return
-    }
-
+    // Use .eq with a direct match (avoids ilike content-type issues)
     const { data, error } = await supabase
       .from('items')
       .select('*')
       .eq('event_id', event.id)
-      .ilike('item_code', cleanCode)
+      .eq('item_code', cleanCode)
       .eq('status', 'available')
       .single()
 
     if (error || !data) {
       setSearchError('Item not found or already sold.')
-    } else {
-      setCart(prev => [...prev, data])
-      setItemCodeInput('')
+      setSearching(false)
+      return
     }
 
+    // Check if already in cart
+    if (cartItems.find(i => i.id === data.id)) {
+      setSearchError('Item already in cart.')
+      setSearching(false)
+      return
+    }
+
+    // Add to server-side cart
+    const addErr = await addToCart(data.id)
+    if (addErr) {
+      setSearchError('Could not add item (maybe just sold).')
+    } else {
+      setItemCodeInput('')
+    }
     setSearching(false)
   }
 
@@ -123,11 +159,7 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
     handleAddByCode(text)
   }
 
-  const handleRemoveFromCart = (itemId) => {
-    setCart(prev => prev.filter(i => i.id !== itemId))
-  }
-
-  const itemsTotal = cart.reduce((sum, item) => sum + parseFloat(item.price), 0)
+  const itemsTotal = cartItems.reduce((sum, item) => sum + parseFloat(item.price), 0)
   const deliveryFee = fulfillment === 'delivery' && !deliveryAlreadyPaid ? DELIVERY_FEE : 0
   const grandTotal = itemsTotal + deliveryFee
 
@@ -137,7 +169,7 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
 
     setConfirming(true)
 
-    // Hard gate: re-check delivery fee against DB right before order creation
+    // Re-check delivery fee to avoid double charges
     let finalDeliveryFee = deliveryFee
     if (fulfillment === 'delivery') {
       const digits = customerPhone.replace(/\D/g, '').slice(-7)
@@ -151,7 +183,6 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
         o.customer_phone &&
         o.customer_phone.replace(/\D/g, '').slice(-7) === digits
       )
-
       if (alreadyPaid) {
         finalDeliveryFee = 0
         setDeliveryAlreadyPaid(true)
@@ -159,51 +190,39 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
     }
 
     const confirmedTotal = itemsTotal + finalDeliveryFee
-    const confirmationNumber = generateConfirmationNumber()
 
-    // Create order
-    const { data: order, error: orderError } = await supabase
-      .from('orders')
-      .insert({
-        event_id: event.id,
-        confirmation_number: confirmationNumber,
-        customer_name: customerName.trim(),
-        customer_phone: customerPhone.trim() || null,
-        fulfillment_type: fulfillment,
-        delivery_address: fulfillment === 'delivery' ? deliveryAddress.trim() : null,
-        total_amount: confirmedTotal,
-        status: 'sold'
+    try {
+      const result = await completeSale(
+        customerName.trim(),
+        customerPhone.trim() || '',
+        fulfillment,
+        confirmedTotal
+      )
+
+      if (!result.success) {
+        alert(result.error + ': ' + (result.failed_items || []).join(', '))
+        setConfirming(false)
+        return
+      }
+
+      setConfirmation({
+        number: result.confirmation_number,
+        name: customerName.trim(),
+        itemCount: cartItems.length,
+        fulfillment,
+        total: confirmedTotal
       })
-      .select()
-      .single()
 
-    if (orderError) {
-      alert('Error creating order. Try again.')
-      setConfirming(false)
-      return
+      setStage('confirm')
+    } catch (err) {
+      alert('An error occurred. Please try again.')
+      console.error(err)
     }
-
-    // Mark all items as sold and link to order
-    const itemIds = cart.map(i => i.id)
-    await supabase
-      .from('items')
-      .update({ status: 'sold', order_id: order.id })
-      .in('id', itemIds)
-
-    setConfirmation({
-      number: confirmationNumber,
-      name: customerName.trim(),
-      itemCount: cart.length,
-      fulfillment,
-      total: confirmedTotal
-    })
-
-    setStage('confirm')
     setConfirming(false)
   }
 
-  const handleNewSale = () => {
-    setCart([])
+  const startNewSale = async () => {
+    await clearCart()
     setItemCodeInput('')
     setCustomerName('')
     setCustomerPhone('')
@@ -213,6 +232,24 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
     setStage('cart')
     setSearchError(null)
   }
+
+  // Real-time: remove sold items from available list
+  useEffect(() => {
+    if (!event) return
+    const subscription = supabase
+      .channel('items-sold')
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'items', filter: `event_id=eq.${event.id}` },
+        (payload) => {
+          if (payload.new.status === 'sold') {
+            setAvailableItems(prev => prev.filter(i => i.id !== payload.new.id))
+          }
+        }
+      )
+      .subscribe()
+
+    return () => { supabase.removeChannel(subscription) }
+  }, [event])
 
   // CONFIRMATION SCREEN
   if (stage === 'confirm' && confirmation) {
@@ -249,7 +286,7 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
           </p>
 
           <button
-            onClick={handleNewSale}
+            onClick={startNewSale}
             className="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-4 rounded-xl transition-colors text-lg"
           >
             New Sale
@@ -316,8 +353,8 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
             </div>
             <div>
               <label className="text-gray-400 text-xs mb-1 block">
-  Phone Number {fulfillment === 'delivery' ? <span className="text-red-400">*</span> : '(optional)'}
-</label>
+                Phone Number {fulfillment === 'delivery' ? <span className="text-red-400">*</span> : '(optional)'}
+              </label>
               <input
                 type="tel"
                 value={customerPhone}
@@ -355,7 +392,7 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
           <div className="bg-[#16213e] rounded-2xl p-4">
             <p className="text-gray-400 text-xs mb-3">Order Summary</p>
             <div className="space-y-1 mb-3">
-              {cart.map(item => (
+              {cartItems.map(item => (
                 <div key={item.id} className="flex justify-between text-sm">
                   <span className="text-gray-300">{item.item_code} — {item.description}</span>
                   <span className="text-white">${parseFloat(item.price).toFixed(2)}</span>
@@ -392,26 +429,68 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
   // CART SCREEN (default)
   return (
     <div className="min-h-screen bg-[#1a1a2e] text-white">
-      {/*scanning && (
+      {/* scanning && (
         <QRScanner
           onScan={handleQRScan}
           onClose={() => setScanning(false)}
         />
-      )*/}
+      ) */}
 
       <header className="bg-[#16213e] px-6 py-4 flex items-center gap-4 shadow-md">
         <button onClick={() => navigate('/dashboard')} className="text-gray-400 hover:text-white transition-colors">
           ← Back
         </button>
         <h1 className="text-xl font-bold">Checkout</h1>
-        {cart.length > 0 && (
+        {cartItems.length > 0 && (
           <span className="ml-auto bg-purple-600 text-white text-xs font-bold px-2 py-1 rounded-full">
-            {cart.length} item{cart.length !== 1 ? 's' : ''}
+            {cartItems.length} item{cartItems.length !== 1 ? 's' : ''}
           </span>
         )}
       </header>
 
       <main className="p-6 max-w-lg mx-auto">
+
+        {/* Booth Selection */}
+        {allBooths.length > 0 && (
+          <div className="mb-4">
+            <p className="text-gray-400 text-xs mb-2">My Booths</p>
+            <div className="flex flex-wrap gap-2">
+              {allBooths.map(booth => (
+                <button
+                  key={booth.id}
+                  onClick={() => toggleBooth(booth.id)}
+                  className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                    assignedBoothIds.includes(booth.id)
+                      ? 'bg-purple-600 text-white'
+                      : 'bg-[#16213e] text-gray-400'
+                  }`}
+                >
+                  {booth.designer_name || `Booth ${booth.booth_number}`}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Available Items Grid (if booths selected) */}
+        {assignedBoothIds.length > 0 && availableItems.length > 0 && (
+          <div className="mb-4">
+            <p className="text-gray-400 text-xs mb-2">Quick Add</p>
+            <div className="grid grid-cols-2 gap-2">
+              {availableItems.map(item => (
+                <button
+                  key={item.id}
+                  onClick={() => addToCart(item.id)}
+                  className="bg-[#16213e] p-2 rounded-lg text-left hover:bg-purple-600/20 transition-colors"
+                >
+                  <p className="text-purple-400 text-xs font-mono">{item.item_code}</p>
+                  <p className="text-white text-xs truncate">{item.description}</p>
+                  <p className="text-green-400 text-xs font-bold">${parseFloat(item.price).toFixed(2)}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Item Search */}
         <div className="bg-[#16213e] rounded-2xl p-4 mb-4">
@@ -445,10 +524,10 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
         </div>
 
         {/* Cart Items */}
-        {cart.length > 0 ? (
+        {cartItems.length > 0 ? (
           <>
             <div className="space-y-2 mb-4">
-              {cart.map(item => (
+              {cartItems.map(item => (
                 <div key={item.id} className="bg-[#16213e] rounded-xl p-4 flex items-center justify-between">
                   <div>
                     <p className="text-purple-400 text-xs font-mono">{item.item_code}</p>
@@ -457,7 +536,7 @@ const [existingDeliveryAddress, setExistingDeliveryAddress] = useState('')
                   <div className="flex items-center gap-3">
                     <p className="text-green-400 font-bold">${parseFloat(item.price).toFixed(2)}</p>
                     <button
-                      onClick={() => handleRemoveFromCart(item.id)}
+                      onClick={() => removeFromCart(item.id)}
                       className="text-red-400 hover:text-red-300 text-lg leading-none"
                     >
                       ×
