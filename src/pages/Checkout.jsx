@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
-import CustomerLookup from '../components/CustomerLookup'
 
 export default function Checkout() {
   const [eventId, setEventId] = useState(null)
@@ -16,6 +15,31 @@ export default function Checkout() {
     }
     getEvent()
   }, [])
+
+  const [allCustomers, setAllCustomers] = useState([])
+
+  useEffect(() => {
+    if (!eventId) return
+    const fetchCustomers = async () => {
+      const { data } = await supabase
+        .from('customers')
+        .select('*')
+        .eq('event_id', eventId)
+        .order('name')
+      setAllCustomers(data || [])
+    }
+    fetchCustomers()
+  }, [eventId])
+
+  // Lookup screen states (top‑level so hooks are always consistent)
+  const [lookupPhone, setLookupPhone] = useState('')
+  const [lookupError, setLookupError] = useState('')
+  const [lookupLoading, setLookupLoading] = useState(false)
+  const [newCustomerForm, setNewCustomerForm] = useState(null)
+  const [newName, setNewName] = useState('')
+  const [newEmail, setNewEmail] = useState('')
+  const [newError, setNewError] = useState('')
+  const [newLoading, setNewLoading] = useState(false)
 
   const [screen, setScreen] = useState('lookup')
   const [customer, setCustomer] = useState(null)
@@ -33,6 +57,13 @@ export default function Checkout() {
   const needsDeliveryFee = hasDeliveryItems && !deliveryPaid
   const subtotal = cart.reduce((sum, item) => sum + Number(item.price), 0)
   const total = needsDeliveryFee ? subtotal + 25 : subtotal
+
+  const formatPhone = (value) => {
+    const digits = value.replace(/\D/g, '').slice(0, 10)
+    if (digits.length <= 3) return digits
+    if (digits.length <= 6) return `${digits.slice(0, 3)}-${digits.slice(3)}`
+    return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`
+  }
 
   const startNewCustomer = () => {
     setScreen('lookup')
@@ -150,18 +181,18 @@ export default function Checkout() {
 
     const confirmationNumber = Math.random().toString(36).substring(2, 6).toUpperCase()
 
-    const orderData = {
-      event_id: eventId,
-      customer_id: customer.id,
-      customerName: customer.name,
-      customerEmail: customer.email || null,
-      customerPhone: customer.phone,
-      items: allItemsArray,
-      totalAmount: total,
-      deliveryAddress: finalAddress,
-      status: 'sold',
-      confirmationNumber
-    }
+const orderData = {
+  event_id: eventId,
+  customer_id: customer.id,
+  customer_name: customer.name,
+  customer_phone: customer.phone,
+  items: allItemsArray,
+  total_amount: total,
+  delivery_address: finalAddress,
+  fulfillment_type: deliveryItems.length > 0 ? 'delivery' : 'pickup',
+  status: 'sold',
+  confirmation_number: confirmationNumber
+}
 
     const { data: order, error } = await supabase
       .from('orders')
@@ -244,7 +275,193 @@ export default function Checkout() {
   }
 
   if (screen === 'lookup') {
-    return <CustomerLookup onCustomerIdentified={handleCustomerIdentified} />
+    const strip = (p) => p.replace(/\D/g, '')
+
+    const handleLookup = async (e) => {
+      e.preventDefault()
+      setLookupError('')
+      const digits = strip(lookupPhone)
+      if (!digits) return setLookupError('Please enter a phone number')
+      setLookupLoading(true)
+      const { data, error } = await supabase
+        .from('customers')
+        .select('*')
+        .eq('event_id', eventId)
+        .eq('phone', digits)
+        .maybeSingle()
+      if (error) {
+        setLookupError('Database error: ' + error.message)
+        setLookupLoading(false)
+        return
+      }
+      if (data) {
+        setLookupLoading(false)
+        handleCustomerIdentified(data)
+      } else {
+        setNewCustomerForm({ phone: digits })
+        setLookupLoading(false)
+      }
+    }
+
+    const handleCreate = async (e) => {
+      e.preventDefault()
+      if (!newName.trim()) return setNewError('Name is required')
+      setNewLoading(true)
+      const customerData = {
+        event_id: eventId,
+        phone: newCustomerForm.phone,
+        name: newName.trim(),
+        email: newEmail.trim() || null,
+        delivery_fee_paid: false,
+        address: null
+      }
+      const { data, error: insertErr } = await supabase
+        .from('customers')
+        .insert(customerData)
+        .select()
+        .single()
+      if (insertErr) {
+        setNewError('Could not create customer: ' + insertErr.message)
+        setNewLoading(false)
+        return
+      }
+      setNewLoading(false)
+      handleCustomerIdentified(data)
+    }
+
+    return (
+      <div className="min-h-screen bg-[#1a1a2e] text-white">
+        <header className="bg-[#16213e] px-6 py-4 shadow-md">
+          <h1 className="text-xl font-bold">Checkout</h1>
+        </header>
+        <main className="p-6 max-w-2xl mx-auto">
+          {!newCustomerForm ? (
+            <>
+              <div className="bg-[#16213e] rounded-2xl p-6 mb-6">
+                <h2 className="text-lg font-semibold mb-4">Checkout Customer</h2>
+                <form onSubmit={handleLookup} className="space-y-4">
+                  <div>
+                    <label htmlFor="phoneLookup" className="text-gray-400 text-sm mb-1 block">Phone Number</label>
+                    <input
+                      id="phoneLookup"
+                      name="phoneLookup"
+                      type="tel"
+                      value={lookupPhone}
+                      onChange={(e) => setLookupPhone(formatPhone(e.target.value))}
+                      onFocus={(e) => e.target.select()}
+                      maxLength={12}
+                      className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-3 text-lg outline-none focus:ring-2 focus:ring-purple-500"
+                      placeholder="000-000-0000"
+                      autoFocus
+                    />
+                  </div>
+                  {lookupError && <p className="text-red-400 text-sm">{lookupError}</p>}
+                  <button
+                    type="submit"
+                    disabled={lookupLoading}
+                    className="w-full bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {lookupLoading ? 'Looking up...' : 'Checkout'}
+                  </button>
+                </form>
+              </div>
+
+              {allCustomers.length > 0 && (
+                <div className="bg-[#16213e] rounded-2xl p-4">
+                  <h3 className="text-white font-semibold mb-3">All Customers</h3>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead>
+                        <tr className="text-gray-400 border-b border-gray-700">
+                          <th className="py-2 pr-3">Name</th>
+                          <th className="py-2 pr-3">Phone</th>
+                          <th className="py-2 pr-3">Status</th>
+                          <th className="py-2"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {allCustomers.map(cust => (
+                          <tr key={cust.id} className="border-b border-gray-700 hover:bg-[#0f3460]/30">
+                            <td className="py-2 pr-3 text-white font-medium">{cust.name}</td>
+                            <td className="py-2 pr-3 text-gray-300">{cust.phone}</td>
+                            <td className="py-2 pr-3">
+                              {cust.delivery_fee_paid && (
+                                <span className="bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full text-xs font-bold">
+                                  Delivery Paid
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-2 text-right">
+                              <button
+                                onClick={() => handleCustomerIdentified(cust)}
+                                className="bg-purple-600 hover:bg-purple-700 text-white font-medium text-xs px-3 py-1.5 rounded-lg transition-colors"
+                              >
+                                Select
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {allCustomers.length === 0 && (
+                <p className="text-gray-500 text-center mt-4">No customers yet.</p>
+              )}
+            </>
+          ) : (
+            <div className="bg-[#16213e] rounded-2xl p-6">
+              <h2 className="text-lg font-semibold mb-4">New Customer</h2>
+              <p className="text-purple-400 text-sm mb-4">Phone: {newCustomerForm.phone}</p>
+              <form onSubmit={handleCreate} className="space-y-4">
+                <div>
+                  <label htmlFor="newName" className="text-gray-400 text-sm mb-1 block">Name *</label>
+                  <input
+                    id="newName"
+                    name="newName"
+                    type="text"
+                    value={newName}
+                    onChange={(e) => setNewName(e.target.value)}
+                    className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                    required
+                  />
+                </div>
+                <div>
+                  <label htmlFor="newEmail" className="text-gray-400 text-sm mb-1 block">Email (optional)</label>
+                  <input
+                    id="newEmail"
+                    name="newEmail"
+                    type="email"
+                    value={newEmail}
+                    onChange={(e) => setNewEmail(e.target.value)}
+                    className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                </div>
+                {newError && <p className="text-red-400 text-sm">{newError}</p>}
+                <div className="flex gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setNewCustomerForm(null)}
+                    className="flex-1 bg-gray-600 hover:bg-gray-700 text-white font-semibold py-3 rounded-lg transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={newLoading}
+                    className="flex-1 bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {newLoading ? 'Saving...' : 'Save & Continue'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
+        </main>
+      </div>
+    )
   }
 
   if (screen === 'confirmation') {
@@ -257,7 +474,7 @@ export default function Checkout() {
           <div className="bg-[#16213e] rounded-2xl p-8">
             <p className="text-4xl mb-4">🎉</p>
             <p className="text-2xl font-bold mb-2">Confirmation #</p>
-            <p className="text-3xl font-mono text-purple-400 mb-6">{confirmation.confirmationNumber}</p>
+            <p className="text-3xl font-mono text-purple-400 mb-6">{confirmation.confirmation_number}</p>
             <p className="text-gray-400 text-sm mb-8">You can now help the next customer.</p>
             <button
               onClick={startNewCustomer}
@@ -458,7 +675,8 @@ export default function Checkout() {
                   <input
                     type="tel"
                     value={editPhone}
-                    onChange={(e) => setEditPhone(e.target.value)}
+                    onChange={(e) => setEditPhone(formatPhone(e.target.value))}
+                    maxLength={12}
                     className="w-full bg-[#0f3460] text-white rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-purple-500"
                   />
                 </div>
